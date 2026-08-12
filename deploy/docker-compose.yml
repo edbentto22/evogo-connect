@@ -1,0 +1,63 @@
+# Stack mínima pra rodar evogo-connect localmente.
+#
+# Pré-requisitos:
+#   - evolution-go já rodando em outro lugar (ou compose separado)
+#   - Chatwoot já rodando em outro lugar (ou compose separado)
+#   - DNS / /etc/hosts apontando o domínio do connector pra localhost
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: connect
+      POSTGRES_PASSWORD: connect
+      POSTGRES_DB: evogo_connect
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U connect -d evogo_connect"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "8443:8443"  # opcional, se quiser TLS local com Caddy
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      connector:
+        condition: service_healthy
+
+  connector:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://connect:connect@postgres:5432/evogo_connect?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/evogo-connect", "--healthcheck"]
+      # fallback simples: toca /healthz via wget (precisa instalar) ou usa um
+      # pequeno healthcheck endpoint no binário. Por ora, só verifica exit.
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:

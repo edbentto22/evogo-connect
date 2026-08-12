@@ -1,0 +1,124 @@
+# evogo-connect
+
+> Bridge standalone entre **[evolution-go](https://github.com/evolution-foundation/evolution-go)**
+> (API WhatsApp) e **[Chatwoot](https://www.chatwoot.com/)** (plataforma de
+> atendimento self-hosted).
+
+[![Status](https://img.shields.io/badge/status-Etapa%201-blue)](#roadmap)
+[![Go](https://img.shields.io/badge/Go-1.24+-00ADD8)](#stack)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue)](LICENSE)
+
+A [evolution-go](https://github.com/evolution-foundation/evolution-go) (a versão
+Go da Evolution API, mantida pela Evolution Foundation) **não tem conector
+nativo para o Chatwoot** — diferente da sua irmã Node, a Evolution API. O
+`evogo-connect` preenche esse gap: um binário Go único que escuta webhooks do
+Chatwoot e fala com a REST API do evolution-go (e vice-versa, nas próximas
+etapas).
+
+## Status atual — Etapa 1
+
+- ✅ **Reverse bridge (Chatwoot → WhatsApp):** mensagem que o agente envia no
+  Chatwoot chega no WhatsApp do cliente, com idempotência, audit log e HMAC.
+- ⏳ Forward bridge (WhatsApp → Chatwoot) — Etapa 2.
+- ⏳ Mídia rica, status updates, grupos — Etapas 5-7.
+
+Ver `.context/plans/2026-08-12-evogo-chatwoot-connector.md` para o roadmap
+completo e `.context/research/` para a investigação.
+
+## Por que este projeto existe
+
+- A Evolution API (Node) tem `CHATWOOT_*` env vars que criam a inbox
+  automaticamente. A evolution-go não.
+- Existem conectores de terceiros para a Evolution API, mas nenhum focado em
+  evolution-go + self-hosted, com audit log e segurança de produção.
+- O [trademark](TRADEMARKS.md) da Evolution Foundation exige atribuição;
+  este projeto respeita isso.
+
+## Stack
+
+- Go 1.24+, Gin, pgx/v5, Cobra, slog, Prometheus, envconfig
+- Postgres 16+ (idempotência, audit, config)
+- Docker / docker-compose para deploy
+- Mesma família de stack do evolution-go (Go + Postgres) — pouca curva
+
+## Quick start
+
+```bash
+# 1. Clonar
+git clone https://github.com/edbentto22/evogo-connect.git
+cd evogo-connect
+
+# 2. Subir Postgres
+docker compose -f deploy/docker-compose.yml up -d postgres
+
+# 3. Copiar e editar .env
+cp .env.example .env
+# editar CONNECT_MASTER_KEY, DATABASE_URL, ADMIN_TOKEN
+
+# 4. Rodar migrations
+make migrate-up
+
+# 5. Build
+make build
+
+# 6. Subir o servidor
+./bin/evogo-connect
+
+# 7. Em outro terminal, provisionar a primeira inbox
+./bin/connect setup --name demo \
+  --chatwoot-url https://chatwoot.example.com \
+  --chatwoot-token <api_access_token> \
+  --chatwoot-account 1 \
+  --evo-url http://localhost:8080 \
+  --evo-key <GLOBAL_API_KEY> \
+  --connect-url http://localhost:9090
+
+# 8. Adicionar um contato (JID WhatsApp → contato Chatwoot)
+./bin/connect add-contact --tenant demo \
+  --jid 5511999999999@s.whatsapp.net \
+  --name "João da Silva"
+```
+
+Pronto. Quando um agente responder no Chatwoot, a mensagem chega no WhatsApp
+do João via evolution-go.
+
+## Arquitetura
+
+```
+┌──────────────┐  webhooks   ┌──────────────────┐  REST   ┌──────────┐
+│  evolution-  │ ──────────► │ evogo-connect    │ ──────► │ Chatwoot │
+│     go       │             │ (Go binary)      │         │ (self-   │
+│              │ ◄────────── │                  │ ◄────── │  hosted) │
+└──────────────┘   send msg  └──────────────────┘ webhooks└──────────┘
+                 (REST)        ▲
+                               │ /admin (ops)
+                               ▼
+                         (PostgreSQL p/ idempotência + audit)
+```
+
+Detalhes em `docs/architecture.md`.
+
+## Segurança
+
+- HMAC bidirecional (Chatwoot + evolution-go)
+- Tokens armazenados AES-GCM criptografados no Postgres
+- Idempotência por `message_id` (evita duplicação em retries)
+- PII nunca em logs (telefone mascarado, content hasheado)
+- Audit log completo em `bridge_log`
+- Kill switch via `POST /admin/pause`
+
+Modelo completo em `docs/security.md`.
+
+## Operações
+
+Ver `docs/operations.md` — health, métricas, troubleshooting, upgrade.
+
+## License
+
+Apache 2.0 (mesma do evolution-go). Ver [LICENSE](LICENSE).
+
+## Trademarks
+
+"Evolution Foundation", "Evolution" e "Evolution Go" são marcas registradas da
+Evolution Foundation. Este projeto é independente e não afiliado oficialmente.
+Powered by Evolution Go.

@@ -1,0 +1,36 @@
+# Binários
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Secrets — NUNCA commitar
+.env
+.env.local
+.env.*.local
+secrets/
+*.pem
+*.key
+*.crt
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Go
+/vendor/
+coverage.out
+coverage.html
+*.prof
+
+# Logs
+*.log
+logs/
+
+# Build artifacts
+tmp/
+scratch/

@@ -1,0 +1,27 @@
+# Caddyfile do evogo-connect.
+# Em produção: usar domínio real + TLS automático.
+# Em dev local: descomentar o bloco abaixo e usar http://localhost:8080
+
+# DEV LOCAL (sem TLS)
+{
+    admin off
+}
+:8080 {
+    reverse_proxy connector:9090 {
+        # Aumenta timeouts pra webhooks que disparam chamadas externas
+        transport http {
+            dial_timeout 10s
+            response_header_timeout 30s
+            read_timeout 30s
+            write_timeout 30s
+        }
+    }
+    log
+}
+
+# PRODUÇÃO (exemplo)
+# evogo-connect.example.com {
+#     reverse_proxy connector:9090
+#     encode gzip zstd
+#     log
+# }
