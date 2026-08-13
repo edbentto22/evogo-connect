@@ -21,6 +21,11 @@ continua sendo apenas uma referência de desenvolvimento.
    Variable** para todos eles.
 6. Confirme `BRIDGE_PAUSED=true` e faça o primeiro deploy.
 
+Esse compose é específico para a execução do Coolify, que usa a raiz clonada
+como `--project-directory`. Para validá-lo fora da plataforma, execute
+`make validate-coolify`; não use diretamente `docker compose -f` sem informar a
+raiz do projeto.
+
 O Coolify gera e preserva automaticamente:
 
 | Magic variable | Uso |
