@@ -143,6 +143,19 @@ Isso cria ou reutiliza o contato pelo campo `identifier`, garante um
 `contact_map`. Pronto — o agente já pode responder e a
 mensagem vai chegar no WhatsApp do João.
 
+Se precisar abrir a conversa do contato pela linha de comando, sem usar um
+token do Chatwoot no terminal:
+
+```bash
+./bin/connect start-conversation \
+  --tenant demo \
+  --jid 5511999999999@s.whatsapp.net
+```
+
+Abra a conversa retornada pelo comando e responda nela. Caso uma requisição
+expire, confirme a conversa no Chatwoot antes de repetir o comando, pois o
+Chatwoot pode ter criado a conversa mesmo sem a resposta chegar ao connector.
+
 ### Adicionar mais contatos
 
 Repita o comando pra cada JID que você quer atender. Pra listar:

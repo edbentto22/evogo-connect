@@ -165,6 +165,9 @@ func (c *Client) CreateConversation(ctx context.Context, sourceID string, contac
 	if err := c.do(ctx, http.MethodPost, path, payload, &out); err != nil {
 		return nil, fmt.Errorf("chatwoot: create conversation: %w", err)
 	}
+	if out.ID == 0 || out.AccountID != c.accountID || out.InboxID != inboxID || out.Status != "open" {
+		return nil, errors.New("chatwoot: conversation returned unexpected binding")
+	}
 	return &out, nil
 }
 

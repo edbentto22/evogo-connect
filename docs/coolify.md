@@ -109,6 +109,19 @@ Ainda no terminal, adicione os contatos necessários durante a Etapa 1:
 /app/connect status
 ```
 
+Para criar uma conversa diretamente na inbox e no contato já configurados, sem
+expor o token do Chatwoot no terminal, use:
+
+```bash
+/app/connect start-conversation \
+  --tenant demo \
+  --jid 5511999999999@s.whatsapp.net
+```
+
+O comando confere o vínculo atual do contato antes de abrir a conversa. Depois,
+envie a resposta nessa conversa recém-aberta; ele não corrige mensagens que já
+tenham sido enviadas em uma conversa antiga com vínculo incorreto.
+
 Se o provisionamento externo falhar, corrija a credencial ou conectividade e
 repita `setup` com o mesmo `--name`. Não apague o volume para tentar corrigir
 uma falha de Chatwoot ou Evolution Go.

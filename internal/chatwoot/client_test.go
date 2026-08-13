@@ -122,6 +122,38 @@ func TestEnsureContactInboxRecoversConcurrentConflict(t *testing.T) {
 	assert.Equal(t, 11, ci.ID)
 }
 
+func TestCreateConversationUsesMappedContactAndInbox(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "/api/v1/accounts/1/conversations", r.URL.Path)
+		assert.Equal(t, "token", r.Header.Get("api_access_token"))
+		var payload ConversationCreatePayload
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+		assert.Equal(t, "5511999999999@s.whatsapp.net", payload.SourceID)
+		assert.Equal(t, 42, payload.ContactID)
+		assert.Equal(t, 7, payload.InboxID)
+		assert.Equal(t, "open", payload.Status)
+		// Este é o formato plano retornado pela action create do Chatwoot/Fazer.ai.
+		_, _ = w.Write([]byte(`{"id":99,"account_id":1,"inbox_id":7,"status":"open"}`))
+	}))
+	defer server.Close()
+
+	conversation, err := NewClient(server.URL, 1, "token").CreateConversation(context.Background(), "5511999999999@s.whatsapp.net", 42, 7)
+	require.NoError(t, err)
+	assert.Equal(t, 99, conversation.ID)
+}
+
+func TestCreateConversationRejectsUnexpectedBinding(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":99,"account_id":1,"inbox_id":8,"status":"open"}`))
+	}))
+	defer server.Close()
+
+	_, err := NewClient(server.URL, 1, "token").CreateConversation(context.Background(), "5511999999999@s.whatsapp.net", 42, 7)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "unexpected binding")
+}
+
 func TestClientHTTPErrorDoesNotExposeResponseBody(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusUnprocessableEntity)

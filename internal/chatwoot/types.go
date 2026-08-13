@@ -196,7 +196,6 @@ type ConversationResponse struct {
 	AccountID int    `json:"account_id"`
 	InboxID   int    `json:"inbox_id"`
 	Status    string `json:"status"`
-	ContactID int    `json:"contact_id"`
 }
 
 // ─── Create message (POST /api/v1/accounts/{account_id}/conversations/{cid}/messages) ───

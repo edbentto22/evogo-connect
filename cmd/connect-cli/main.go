@@ -4,6 +4,7 @@
 //
 //	setup        — cria inbox API no Chatwoot, registra tenant no connector
 //	add-contact  — cria contato no Chatwoot, mapeia JID → contact_id
+//	start-conversation — cria conversa para um contato já mapeado
 //	list         — lista tenants
 //	status       — status do connector (paused, tenants, etc)
 package main
@@ -23,6 +24,7 @@ var rootCmd = &cobra.Command{
 Subcomandos principais:
   setup        Cria inbox API no Chatwoot e registra tenant.
   add-contact  Mapeia um JID WhatsApp a um contato no Chatwoot.
+  start-conversation  Cria uma conversa para um contato já mapeado.
   list         Lista tenants configurados.
   status       Mostra status do connector (paused/running, contagens).
   pause        Ativa kill switch (pára de processar webhooks).
@@ -38,5 +40,5 @@ func main() {
 }
 
 func init() {
-	rootCmd.AddCommand(setupCmd, addContactCmd, listCmd, statusCmd, pauseCmd, resumeCmd)
+	rootCmd.AddCommand(setupCmd, addContactCmd, startConversationCmd, listCmd, statusCmd, pauseCmd, resumeCmd)
 }
