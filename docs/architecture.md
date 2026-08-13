@@ -74,7 +74,9 @@ cmd/connect-cli/main.go     — CLI de provisionamento
 4. **bridge.Core.HandleChatwootWebhook** (`internal/bridge/bridge.go`):
    - Checa kill switch (env + DB)
    - Filtra: `message_created` + `outgoing` + `!private`
-   - Resolve JID via `conversation.contact_inbox.source_id`
+   - Resolve JID via `conversation.contact_inbox.source_id`; para webhooks
+     outgoing do Fazer.ai que omitirem esse campo, usa
+     `conversation.meta.sender.identifier` como fallback validado.
    - Adquire atomicamente o claim de idempotência antes do envio
    - Cria `evogo.Client`, chama `SendText` ou `SendMedia`
    - Conclui o claim e grava `bridge_log` sem PII; falha de envio libera retry

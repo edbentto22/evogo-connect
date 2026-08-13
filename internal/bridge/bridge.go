@@ -183,12 +183,25 @@ func (c *Core) HandleChatwootWebhook(ctx context.Context, env chatwoot.WebhookEn
 	}
 	log = log.With("tenant", tenant.Name)
 
-	// 4. Resolve JID via contact_inbox.source_id
-	jid, number, jidErr := evogo.ParseDirectJID(env.Conversation.ContactInbox.SourceID)
+	// 4. Resolve JID via contact_inbox.source_id. O Fazer.ai pode serializar
+	// esse objeto sem source_id em webhooks de mensagens outgoing, mas mantém
+	// o identifier do mesmo contato em conversation.meta.sender.
+	sourceID := strings.TrimSpace(env.Conversation.ContactInbox.SourceID)
+	sourceField := "contact_inbox.source_id"
+	if sourceID == "" {
+		sourceID = env.Conversation.Meta.Sender.Identifier
+		sourceField = "conversation.meta.sender.identifier"
+		log.Info("bridge: using Chatwoot contact identifier fallback")
+	}
+	jid, number, jidErr := evogo.ParseDirectJID(sourceID)
 	if jidErr != nil {
-		metrics.BridgeErrors.WithLabelValues("empty_source_id", "bridge").Inc()
-		auditErr := c.logAudit(ctx, tenant.ID, DirC2W, fmt.Sprintf("%d", env.ID), "", nil, "error", "invalid_source_id", "source_id inválido", 0)
-		return errors.Join(fmt.Errorf("bridge: validate source_id: %w", jidErr), auditErr)
+		errCode := "invalid_source_id"
+		if sourceField == "conversation.meta.sender.identifier" {
+			errCode = "invalid_contact_identifier"
+		}
+		metrics.BridgeErrors.WithLabelValues(errCode, "bridge").Inc()
+		auditErr := c.logAudit(ctx, tenant.ID, DirC2W, fmt.Sprintf("%d", env.ID), "", nil, "error", errCode, "identificador WhatsApp inválido", 0)
+		return errors.Join(fmt.Errorf("bridge: validate %s: %w", sourceField, jidErr), auditErr)
 	}
 
 	// 5. Reserva idempotente antes do efeito externo. Claims de processamento

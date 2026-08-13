@@ -183,6 +183,76 @@ func TestHandleChatwootWebhookAcceptsFazerAIOutgoingEvent(t *testing.T) {
 	assert.Equal(t, int32(1), calls.Load())
 }
 
+func TestHandleChatwootWebhookUsesFazerAIContactIdentifierFallback(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		assert.Equal(t, "5511999999999", body["number"])
+		_, _ = w.Write([]byte(`{"status":"sent"}`))
+	}))
+	defer server.Close()
+
+	st := newMemoryBridgeStore(server.URL)
+	core := New(st, 24*time.Hour, false, 0)
+	var env chatwoot.WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"event":"message_outgoing",
+		"id":124,
+		"content":"teste fazer.ai",
+		"message_type":"outgoing",
+		"private":false,
+		"created_at":"2026-08-13T14:08:02.000Z",
+		"conversation":{
+			"id":456,
+			"inbox_id":7,
+			"contact_inbox":{},
+			"meta":{"sender":{"identifier":"5511999999999@s.whatsapp.net"}}
+		}
+	}`), &env))
+
+	require.NoError(t, core.HandleChatwootWebhook(context.Background(), env))
+	assert.Equal(t, int32(1), calls.Load())
+}
+
+func TestHandleChatwootWebhookPrefersCanonicalSourceID(t *testing.T) {
+	var number string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		number, _ = body["number"].(string)
+		_, _ = w.Write([]byte(`{"status":"sent"}`))
+	}))
+	defer server.Close()
+
+	st := newMemoryBridgeStore(server.URL)
+	core := New(st, 24*time.Hour, false, 0)
+	env := validEnvelope()
+	env.ID = 125
+	env.Conversation.Meta.Sender.Identifier = "5511888888888@s.whatsapp.net"
+	require.NoError(t, core.HandleChatwootWebhook(context.Background(), env))
+	assert.Equal(t, "5511999999999", number)
+}
+
+func TestHandleChatwootWebhookUsesFallbackWhenSourceIDIsWhitespace(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(`{"status":"sent"}`))
+	}))
+	defer server.Close()
+
+	st := newMemoryBridgeStore(server.URL)
+	core := New(st, 24*time.Hour, false, 0)
+	env := validEnvelope()
+	env.ID = 126
+	env.Conversation.ContactInbox.SourceID = "  "
+	env.Conversation.Meta.Sender.Identifier = "5511999999999@s.whatsapp.net"
+	require.NoError(t, core.HandleChatwootWebhook(context.Background(), env))
+	assert.Equal(t, int32(1), calls.Load())
+}
+
 func TestHandleChatwootWebhookDeduplicatesFazerAIEventsInEitherOrder(t *testing.T) {
 	for _, first := range []string{"message_created", "message_outgoing"} {
 		t.Run(first, func(t *testing.T) {

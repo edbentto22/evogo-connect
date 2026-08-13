@@ -71,10 +71,23 @@ type WebhookEnvelope struct {
 type ConversationRef struct {
 	ID           int64            `json:"id"`
 	ContactInbox ContactInbox     `json:"contact_inbox"`
+	Meta         ConversationMeta `json:"meta"`
 	AccountID    int              `json:"account_id"`
 	InboxID      int              `json:"inbox_id"`
 	Status       string           `json:"status"`
 	CreatedAt    WebhookTimestamp `json:"created_at"`
+}
+
+// ConversationMeta contém a representação do contato incluída pelo webhook
+// do Chatwoot/Fazer.ai. Identifier é um fallback para forks que omitem
+// contact_inbox.source_id na serialização de mensagens outgoing.
+type ConversationMeta struct {
+	Sender ConversationContact `json:"sender"`
+}
+
+// ConversationContact identifica o contato associado à conversa.
+type ConversationContact struct {
+	Identifier string `json:"identifier"`
 }
 
 // ContactInbox referencia a session do contato na inbox.
