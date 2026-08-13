@@ -2,17 +2,62 @@
 // webhook payload da API Channel inbox.
 package chatwoot
 
+import (
+	"encoding/json"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// WebhookTimestamp aceita os dois contratos observados em webhooks do
+// Chatwoot: Unix timestamp numérico e timestamp serializado como string.
+// Strings RFC3339 são normalizadas para Unix seconds, mantendo a semântica do
+// contrato numérico original.
+type WebhookTimestamp int64
+
+func (t *WebhookTimestamp) UnmarshalJSON(data []byte) error {
+	raw := strings.TrimSpace(string(data))
+	if raw == "" || raw == "null" {
+		return fmt.Errorf("decode webhook timestamp: value is required")
+	}
+
+	if strings.HasPrefix(raw, `"`) {
+		var text string
+		if err := json.Unmarshal(data, &text); err != nil {
+			return fmt.Errorf("decode webhook timestamp string: %w", err)
+		}
+		if seconds, err := strconv.ParseInt(text, 10, 64); err == nil {
+			*t = WebhookTimestamp(seconds)
+			return nil
+		}
+		parsed, err := time.Parse(time.RFC3339Nano, text)
+		if err != nil {
+			return fmt.Errorf("decode webhook timestamp string: %w", err)
+		}
+		*t = WebhookTimestamp(parsed.Unix())
+		return nil
+	}
+
+	var seconds int64
+	if err := json.Unmarshal(data, &seconds); err != nil {
+		return fmt.Errorf("decode webhook timestamp: %w", err)
+	}
+	*t = WebhookTimestamp(seconds)
+	return nil
+}
+
 // ─── Webhook payload (Chatwoot API Channel) ──────────────────────────────
 
 // WebhookEnvelope é o payload que o Chatwoot POSTa no webhook_url da inbox.
 type WebhookEnvelope struct {
-	Event       string `json:"event"`        // "message_created", "message_updated", "conversation_*"
-	MessageType string `json:"message_type"` // "incoming" | "outgoing"
-	ID          int64  `json:"id"`           // ID da mensagem
-	Content     string `json:"content"`
-	ContentType string `json:"content_type"` // "text", "input_email", etc.
-	Private     bool   `json:"private"`
-	CreatedAt   int64  `json:"created_at"` // unix seconds
+	Event       string           `json:"event"`        // "message_created", "message_updated", "conversation_*"
+	MessageType string           `json:"message_type"` // "incoming" | "outgoing"
+	ID          int64            `json:"id"`           // ID da mensagem
+	Content     string           `json:"content"`
+	ContentType string           `json:"content_type"` // "text", "input_email", etc.
+	Private     bool             `json:"private"`
+	CreatedAt   WebhookTimestamp `json:"created_at"`
 
 	Conversation ConversationRef `json:"conversation"`
 	Sender       SenderRef       `json:"sender"`
@@ -24,12 +69,12 @@ type WebhookEnvelope struct {
 
 // ConversationRef é a referência à conversa.
 type ConversationRef struct {
-	ID           int64        `json:"id"`
-	ContactInbox ContactInbox `json:"contact_inbox"`
-	AccountID    int          `json:"account_id"`
-	InboxID      int          `json:"inbox_id"`
-	Status       string       `json:"status"`
-	CreatedAt    int64        `json:"created_at"`
+	ID           int64            `json:"id"`
+	ContactInbox ContactInbox     `json:"contact_inbox"`
+	AccountID    int              `json:"account_id"`
+	InboxID      int              `json:"inbox_id"`
+	Status       string           `json:"status"`
+	CreatedAt    WebhookTimestamp `json:"created_at"`
 }
 
 // ContactInbox referencia a session do contato na inbox.

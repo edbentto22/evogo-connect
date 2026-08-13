@@ -53,6 +53,8 @@ func TestWebhookEnvelopeDecode(t *testing.T) {
 	if env.ID != 12345 {
 		t.Errorf("id=%d", env.ID)
 	}
+	assert.Equal(t, WebhookTimestamp(1698765432), env.CreatedAt)
+	assert.Equal(t, WebhookTimestamp(1698765400), env.Conversation.CreatedAt)
 	if env.Conversation.ContactInbox.SourceID != "5511999999999@s.whatsapp.net" {
 		t.Errorf("source_id=%q", env.Conversation.ContactInbox.SourceID)
 	}
@@ -61,6 +63,56 @@ func TestWebhookEnvelopeDecode(t *testing.T) {
 	}
 	if env.InboxID != 7 {
 		t.Errorf("top-level inbox_id=%d", env.InboxID)
+	}
+}
+
+func TestWebhookEnvelopeDecodeStringTimestamps(t *testing.T) {
+	raw := `{
+		"event":"message_created",
+		"message_type":"outgoing",
+		"id":12345,
+		"created_at":"2026-08-13T13:50:34.000Z",
+		"conversation":{
+			"id":678,
+			"created_at":1786628940,
+			"inbox_id":21,
+			"contact_inbox":{
+				"source_id":"5571999999999@s.whatsapp.net",
+				"inbox_id":21
+			}
+		}
+	}`
+
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(raw), &env))
+	assert.Equal(t, WebhookTimestamp(1786629034), env.CreatedAt)
+	assert.Equal(t, WebhookTimestamp(1786628940), env.Conversation.CreatedAt)
+}
+
+func TestWebhookTimestampAcceptsUnixString(t *testing.T) {
+	var timestamp WebhookTimestamp
+	require.NoError(t, json.Unmarshal([]byte(`"1698765432"`), &timestamp))
+	assert.Equal(t, WebhookTimestamp(1698765432), timestamp)
+
+	encoded, err := json.Marshal(timestamp)
+	require.NoError(t, err)
+	assert.JSONEq(t, `1698765432`, string(encoded))
+}
+
+func TestWebhookTimestampRejectsUnsupportedValues(t *testing.T) {
+	for _, raw := range []string{
+		`null`,
+		`""`,
+		`"not-a-timestamp"`,
+		`{"unexpected":true}`,
+		`true`,
+		`[]`,
+		`1698765432.5`,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			var timestamp WebhookTimestamp
+			require.Error(t, json.Unmarshal([]byte(raw), &timestamp))
+		})
 	}
 }
 
