@@ -13,9 +13,11 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/time/rate"
 
 	"github.com/edbentto22/evogo-connect/internal/chatwoot"
 	"github.com/edbentto22/evogo-connect/internal/evogo"
@@ -53,16 +55,45 @@ type Core struct {
 	Store          *store.Store
 	IdempotencyTTL time.Duration
 	Paused         bool // valor carregado do env na inicialização
-	// RateLimit por tenant+direction — passado pelo caller
+	LimitPerMin    int  // limite por minuto, por (tenant, direction)
+
+	// limiters é um cache lazy de *rate.Limiter por chave `tenantID:direction`.
+	// sync.Map porque o padrão de uso é read-heavy (cada webhook lê o limiter
+	// do seu tenant) e write-rare (só na primeira request do tenant).
+	limiters sync.Map
 }
 
 // New cria o Core.
-func New(s *store.Store, idempotencyTTL time.Duration, paused bool) *Core {
+func New(s *store.Store, idempotencyTTL time.Duration, paused bool, limitPerMin int) *Core {
 	return &Core{
 		Store:          s,
 		IdempotencyTTL: idempotencyTTL,
 		Paused:         paused,
+		LimitPerMin:    limitPerMin,
 	}
+}
+
+// limiterKey compõe a chave do limiter pra sync.Map.
+func limiterKey(tenantID uuid.UUID, dir Direction) string {
+	return tenantID.String() + ":" + string(dir)
+}
+
+// getLimiter devolve o limiter pra (tenant, direction), criando sob demanda.
+// O rate é `LimitPerMin / 60` por segundo, com burst igual ao limite/10
+// (mínimo 1) — permite pequenos picos sem travar tudo.
+func (c *Core) getLimiter(tenantID uuid.UUID, dir Direction) *rate.Limiter {
+	key := limiterKey(tenantID, dir)
+	if v, ok := c.limiters.Load(key); ok {
+		return v.(*rate.Limiter)
+	}
+	perSec := rate.Limit(float64(c.LimitPerMin) / 60.0)
+	burst := c.LimitPerMin / 10
+	if burst < 1 {
+		burst = 1
+	}
+	lim := rate.NewLimiter(perSec, burst)
+	actual, _ := c.limiters.LoadOrStore(key, lim)
+	return actual.(*rate.Limiter)
 }
 
 // IsPaused checa kill switch (DB tem prioridade sobre env, para toggle on-the-fly).
@@ -106,6 +137,21 @@ func (c *Core) HandleChatwootWebhook(ctx context.Context, env chatwoot.WebhookEn
 	if paused {
 		metrics.BridgeMessages.WithLabelValues(string(DirC2W), "paused").Inc()
 		return ErrPaused
+	}
+
+	// 1.5. Resolve tenant primeiro (precisamos do ID pro rate limiter).
+	// O resolve de tenant aqui duplica o do passo 3, mas o limitador precisa
+	// do ID antes pra não contar requests que vão falhar por tenant ausente.
+	preTenant, err := c.Store.GetTenantByChatwootInbox(ctx, env.Conversation.InboxID)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return fmt.Errorf("bridge: pre-resolve tenant: %w", err)
+	}
+	if preTenant != nil && c.LimitPerMin > 0 {
+		if !c.getLimiter(preTenant.ID, DirC2W).Allow() {
+			metrics.BridgeMessages.WithLabelValues(string(DirC2W), "rate_limited").Inc()
+			metrics.BridgeErrors.WithLabelValues("rate_limited", "bridge").Inc()
+			return ErrRateLimited
+		}
 	}
 
 	// 2. Filtro de evento

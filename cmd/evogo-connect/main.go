@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -26,10 +27,53 @@ import (
 )
 
 func main() {
+	// Healthcheck mode pro Docker HEALTHCHECK.
+	// Uso: ./evogo-connect --healthcheck → exit 0 se /readyz 200, 1 caso contrário.
+	for _, arg := range os.Args[1:] {
+		if arg == "--healthcheck" {
+			runHealthcheck()
+			return
+		}
+	}
+
 	if err := run(); err != nil {
 		slog.Default().Error("fatal", "err", err)
 		os.Exit(1)
 	}
+}
+
+// runHealthcheck faz GET /readyz no servidor local. Assume que o servidor
+// está rodando em SERVER_ADDR (default :9090). Retorna exit 0 se /readyz
+// responde 200, 1 caso contrário.
+func runHealthcheck() {
+	addr := os.Getenv("SERVER_ADDR")
+	if addr == "" {
+		addr = ":9090"
+	}
+	url := buildHealthcheckURL(addr) + "/readyz"
+	resp, err := http.Get(url)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "healthcheck: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		fmt.Fprintf(os.Stderr, "healthcheck: status %d\n", resp.StatusCode)
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+// buildHealthcheckURL normaliza SERVER_ADDR em uma URL http válida.
+// Aceita ":9090", "0.0.0.0:9090", "localhost:9090" ou URL completa.
+func buildHealthcheckURL(addr string) string {
+	if strings.HasPrefix(addr, "http://") || strings.HasPrefix(addr, "https://") {
+		return addr
+	}
+	if strings.HasPrefix(addr, ":") {
+		return "http://localhost" + addr
+	}
+	return "http://" + addr
 }
 
 func run() error {
@@ -70,7 +114,7 @@ func run() error {
 	slog.Default().Info("migrations applied")
 
 	// Bridge core
-	core := bridge.New(st, cfg.IdempotencyTTL, cfg.BridgePaused)
+	core := bridge.New(st, cfg.IdempotencyTTL, cfg.BridgePaused, cfg.RateLimitPerMinute)
 
 	// Router HTTP
 	router := httpapi.NewRouter(httpapi.Deps{
