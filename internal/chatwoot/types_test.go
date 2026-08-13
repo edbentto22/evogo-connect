@@ -3,6 +3,9 @@ package chatwoot
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestWebhookEnvelopeDecode garante que o payload típico do Chatwoot é
@@ -20,6 +23,7 @@ func TestWebhookEnvelopeDecode(t *testing.T) {
 		"account_id": 1,
 		"conversation": {
 			"id": 678,
+			"created_at": 1698765400,
 			"inbox_id": 7,
 			"account_id": 1,
 			"status": "open",
@@ -60,6 +64,25 @@ func TestWebhookEnvelopeDecode(t *testing.T) {
 	}
 }
 
+func TestInboxResponseFlatContract(t *testing.T) {
+	raw := `{
+		"id":7,
+		"name":"WhatsApp",
+		"channel_id":9,
+		"channel_type":"Channel::Api",
+		"hmac_token":"legacy-token",
+		"secret":"webhook-secret",
+		"webhook_url":"https://connector.example.com/webhook/chatwoot",
+		"inbox_identifier":"identifier"
+	}`
+	var inbox InboxResponse
+	require.NoError(t, json.Unmarshal([]byte(raw), &inbox))
+	assert.Equal(t, 7, inbox.ID)
+	assert.Equal(t, "webhook-secret", inbox.Secret)
+	assert.Equal(t, "legacy-token", inbox.HMACToken)
+	assert.Equal(t, "identifier", inbox.InboxIdentifier)
+}
+
 // TestWebhookEnvelopeWithAttachment cobre mídia.
 func TestWebhookEnvelopeWithAttachment(t *testing.T) {
 	raw := `{
@@ -72,7 +95,7 @@ func TestWebhookEnvelopeWithAttachment(t *testing.T) {
 			"contact_inbox": {"source_id":"5511@s.whatsapp.net","inbox_id":1,"contact_id":1}
 		},
 		"attachments": [
-			{"id":99,"file_type":"file","file_url":"https://example.com/doc.pdf","file_name":"doc.pdf"}
+			{"id":99,"file_type":"file","data_url":"https://example.com/doc.pdf","content_type":"application/pdf","extension":"pdf"}
 		]
 	}`
 	var env WebhookEnvelope
@@ -84,5 +107,8 @@ func TestWebhookEnvelopeWithAttachment(t *testing.T) {
 	}
 	if env.Attachments[0].FileType != "file" {
 		t.Errorf("file_type=%q", env.Attachments[0].FileType)
+	}
+	if env.Attachments[0].DataURL != "https://example.com/doc.pdf" {
+		t.Errorf("data_url=%q", env.Attachments[0].DataURL)
 	}
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -36,7 +37,7 @@ Exemplo:
     --chatwoot-token $CW_TOKEN \
     --chatwoot-account 1 \
     --evo-url http://localhost:8080 \
-    --evo-key $EVO_GLOBAL_KEY \
+    --evo-key $EVO_INSTANCE_TOKEN \
     --evo-instance demo \
     --connect-url https://evogo-connect.example.com`,
 	RunE: runSetup,
@@ -48,7 +49,7 @@ func init() {
 	setupCmd.Flags().StringVar(&flagChatwootToken, "chatwoot-token", "", "api_access_token do Chatwoot (obrigatório)")
 	setupCmd.Flags().IntVar(&flagChatwootAcct, "chatwoot-account", 0, "ID da account no Chatwoot (obrigatório)")
 	setupCmd.Flags().StringVar(&flagEvoURL, "evo-url", "", "URL base do evolution-go (obrigatório)")
-	setupCmd.Flags().StringVar(&flagEvoKey, "evo-key", "", "GLOBAL_API_KEY do evolution-go (obrigatório)")
+	setupCmd.Flags().StringVar(&flagEvoKey, "evo-key", "", "token individual da instância Evolution Go (obrigatório)")
 	setupCmd.Flags().StringVar(&flagEvoInstance, "evo-instance", "", "nome da instância no evolution-go (obrigatório)")
 	setupCmd.Flags().StringVar(&flagConnectURL, "connect-url", "", "URL pública deste connector (obrigatório, usada como webhook)")
 	_ = setupCmd.MarkFlagRequired("name")
@@ -72,8 +73,48 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	}
 	defer st.Close()
 
-	// 1. Cria inbox no Chatwoot
+	// 1. Valida a instância antes de criar recursos no Chatwoot. Rotas
+	// autenticadas do Evolution Go usam o token individual da instância.
+	evo := evogo.NewClient(flagEvoURL, flagEvoKey)
+	status, err := evo.GetStatus(ctx)
+	if err != nil {
+		return fmt.Errorf("validate Evolution Go instance token: %w", err)
+	}
+	if status.Message != "success" {
+		return fmt.Errorf("Evolution Go returned an incomplete instance status")
+	}
+	fmt.Println("✓ Token individual da instância Evolution Go validado")
+
+	// 2. Atualiza tenant legado in-place quando o nome já existe. Isso migra
+	// hmac_token/GLOBAL_API_KEY antigos sem quebrar IDs e contatos locais.
 	cw := chatwoot.NewClient(flagChatwootURL, flagChatwootAcct, flagChatwootToken)
+	existing, err := st.GetTenantByName(ctx, flagTenantName)
+	if err == nil {
+		inbox, err := cw.GetInbox(ctx, existing.ChatwootInboxID)
+		if err != nil {
+			return fmt.Errorf("load existing Chatwoot inbox %d: %w", existing.ChatwootInboxID, err)
+		}
+		if inbox.Secret == "" {
+			return fmt.Errorf("existing Chatwoot inbox %d has no webhook secret", existing.ChatwootInboxID)
+		}
+		existing.ChatwootAccountID = flagChatwootAcct
+		existing.ChatwootBaseURL = strings.TrimRight(flagChatwootURL, "/")
+		existing.ChatwootToken = flagChatwootToken
+		existing.ChatwootHMAC = inbox.Secret
+		existing.EvoInstanceName = flagEvoInstance
+		existing.EvoBaseURL = strings.TrimRight(flagEvoURL, "/")
+		existing.EvoAPIKey = flagEvoKey
+		if err := st.UpdateTenantIntegration(ctx, existing); err != nil {
+			return fmt.Errorf("update existing tenant: %w", err)
+		}
+		fmt.Printf("✓ Tenant '%s' atualizado sem recriar a inbox (id=%s)\n", existing.Name, existing.ID)
+		return nil
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		return fmt.Errorf("check existing tenant: %w", err)
+	}
+
+	// 3. Cria inbox no Chatwoot para um tenant novo.
 	webhookURL := strings.TrimRight(flagConnectURL, "/") + "/webhook/chatwoot"
 	inbox, err := cw.CreateAPIInbox(ctx, "evogo-connect/"+flagTenantName, webhookURL)
 	if err != nil {
@@ -81,39 +122,26 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Printf("✓ Inbox criada no Chatwoot: id=%d\n", inbox.ID)
 
-	hmacToken := inbox.Channel.HMACToken
-	if hmacToken == "" {
-		fmt.Println("⚠ Chatwoot não retornou hmac_token (inbox sem HMAC — bridge vai aceitar webhooks sem assinatura)")
+	webhookSecret := inbox.Secret
+	if webhookSecret == "" {
+		return fmt.Errorf("Chatwoot inbox %d created without webhook secret; remove the orphan inbox before retrying", inbox.ID)
 	}
 
-	// 2. Configura webhook no evolution-go
-	evo := evogo.NewClient(flagEvoURL, flagEvoKey)
-	webhookURLForEvo := strings.TrimRight(flagConnectURL, "/") + "/webhook/evo/" + flagEvoInstance
-	if err := evo.SetWebhook(ctx, flagEvoInstance, webhookURLForEvo, []string{
-		"MESSAGES_UPSERT",
-		"MESSAGES_UPDATE",
-		"CONNECTION_UPDATE",
-	}, false); err != nil {
-		fmt.Printf("⚠ Falha ao configurar webhook no evolution-go: %v\n", err)
-		fmt.Println("  Você pode configurar manualmente depois via POST /webhook/set/<instance>")
-	} else {
-		fmt.Printf("✓ Webhook configurado no evolution-go: %s\n", webhookURLForEvo)
-	}
-
-	// 3. Persiste tenant
+	// 4. Persiste tenant. O webhook Evolution Go → Chatwoot não faz parte
+	// desta etapa e não é configurado até existir um handler de entrada seguro.
 	t := &store.Tenant{
 		Name:              flagTenantName,
 		ChatwootAccountID: flagChatwootAcct,
 		ChatwootInboxID:   inbox.ID,
 		ChatwootBaseURL:   strings.TrimRight(flagChatwootURL, "/"),
 		ChatwootToken:     flagChatwootToken,
-		ChatwootHMAC:      hmacToken,
+		ChatwootHMAC:      webhookSecret,
 		EvoInstanceName:   flagEvoInstance,
 		EvoBaseURL:        strings.TrimRight(flagEvoURL, "/"),
 		EvoAPIKey:         flagEvoKey,
 	}
 	if err := st.CreateTenant(ctx, t); err != nil {
-		return fmt.Errorf("persist tenant: %w", err)
+		return fmt.Errorf("persist tenant after creating Chatwoot inbox %d; remove the orphan inbox before retrying: %w", inbox.ID, err)
 	}
 	fmt.Printf("✓ Tenant '%s' registrado (id=%s)\n", t.Name, t.ID)
 	fmt.Println()

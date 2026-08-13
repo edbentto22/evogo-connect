@@ -8,6 +8,7 @@ package bridge
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -48,11 +49,15 @@ var ErrPaused = errors.New("bridge: paused")
 // ErrRateLimited é retornado quando o rate limiter recusa.
 var ErrRateLimited = errors.New("bridge: rate limited")
 
+// ErrInProgress pede ao emissor que retente enquanto outra execução mantém o
+// claim. Diferente de uma entrega concluída, não deve produzir HTTP 200.
+var ErrInProgress = errors.New("bridge: delivery in progress")
+
 // ─── Core ────────────────────────────────────────────────────────────────
 
 // Core é o motor do bridge.
 type Core struct {
-	Store          *store.Store
+	Store          BridgeStore
 	IdempotencyTTL time.Duration
 	Paused         bool // valor carregado do env na inicialização
 	LimitPerMin    int  // limite por minuto, por (tenant, direction)
@@ -63,8 +68,18 @@ type Core struct {
 	limiters sync.Map
 }
 
+// BridgeStore contém apenas as operações persistentes usadas pelo core.
+type BridgeStore interface {
+	IsPaused(context.Context) (bool, error)
+	GetTenantByChatwootInbox(context.Context, int) (*store.Tenant, error)
+	ClaimIdempotency(context.Context, string, string, uuid.UUID, time.Duration, string) (store.IdempotencyClaim, error)
+	CompleteDelivery(context.Context, string, string, string, []byte, time.Duration, store.BridgeLogEntry) error
+	ReleaseIdempotency(context.Context, string, string, string) error
+	LogBridge(context.Context, store.BridgeLogEntry) error
+}
+
 // New cria o Core.
-func New(s *store.Store, idempotencyTTL time.Duration, paused bool, limitPerMin int) *Core {
+func New(s BridgeStore, idempotencyTTL time.Duration, paused bool, limitPerMin int) *Core {
 	return &Core{
 		Store:          s,
 		IdempotencyTTL: idempotencyTTL,
@@ -112,14 +127,13 @@ func (c *Core) IsPaused(ctx context.Context) (bool, error) {
 //
 // Fluxo:
 //  1. Verifica kill switch
-//  2. Valida HMAC (feito no handler antes de chegar aqui)
-//  3. Filtra: só processa message_created + outgoing + !private
-//  4. Resolve tenant pelo inbox_id
-//  5. Resolve JID do WhatsApp via contact_map (source_id = JID)
-//  6. Checagem de idempotência por chatwoot_message_id
-//  7. Envia texto/mídia via evolution-go
-//  8. Grava audit log + idempotency_keys
-func (c *Core) HandleChatwootWebhook(ctx context.Context, env chatwoot.WebhookEnvelope, signature, hmacToken, hmacMode string, rawBody []byte) error {
+//  2. Filtra: só processa message_created + outgoing + !private
+//  3. Resolve tenant pelo inbox_id
+//  4. Resolve JID via contact_inbox.source_id
+//  5. Adquire claim idempotente por chatwoot_message_id
+//  6. Envia texto/mídia via Evolution Go
+//  7. Conclui a idempotência e grava audit log
+func (c *Core) HandleChatwootWebhook(ctx context.Context, env chatwoot.WebhookEnvelope) error {
 	start := time.Now()
 	log := slog.Default().With(
 		"event", env.Event,
@@ -137,21 +151,6 @@ func (c *Core) HandleChatwootWebhook(ctx context.Context, env chatwoot.WebhookEn
 	if paused {
 		metrics.BridgeMessages.WithLabelValues(string(DirC2W), "paused").Inc()
 		return ErrPaused
-	}
-
-	// 1.5. Resolve tenant primeiro (precisamos do ID pro rate limiter).
-	// O resolve de tenant aqui duplica o do passo 3, mas o limitador precisa
-	// do ID antes pra não contar requests que vão falhar por tenant ausente.
-	preTenant, err := c.Store.GetTenantByChatwootInbox(ctx, env.Conversation.InboxID)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		return fmt.Errorf("bridge: pre-resolve tenant: %w", err)
-	}
-	if preTenant != nil && c.LimitPerMin > 0 {
-		if !c.getLimiter(preTenant.ID, DirC2W).Allow() {
-			metrics.BridgeMessages.WithLabelValues(string(DirC2W), "rate_limited").Inc()
-			metrics.BridgeErrors.WithLabelValues("rate_limited", "bridge").Inc()
-			return ErrRateLimited
-		}
 	}
 
 	// 2. Filtro de evento
@@ -179,82 +178,101 @@ func (c *Core) HandleChatwootWebhook(ctx context.Context, env chatwoot.WebhookEn
 	}
 	log = log.With("tenant", tenant.Name)
 
-	// 4. Valida HMAC (defesa em profundidade — handler já validou, mas
-	//    checamos de novo aqui dentro caso o handler tenha sido bypassado)
-	if hmacToken != "" {
-		if !chatwoot.VerifySignature(signature, hmacToken, string(rawBody), hmacMode) {
-			metrics.BridgeErrors.WithLabelValues("hmac_invalid", "bridge").Inc()
-			c.logAudit(ctx, tenant.ID, DirC2W, fmt.Sprintf("%d", env.ID), env.Conversation.ContactInbox.SourceID, nil, "error", "hmac_invalid", "HMAC mismatch in core", 0)
-			return fmt.Errorf("bridge: HMAC invalid for inbox %d", env.Conversation.InboxID)
-		}
-	}
-
-	// 5. Resolve JID via contact_map
-	jid := env.Conversation.ContactInbox.SourceID
-	if jid == "" {
+	// 4. Resolve JID via contact_inbox.source_id
+	jid, number, jidErr := evogo.ParseDirectJID(env.Conversation.ContactInbox.SourceID)
+	if jidErr != nil {
 		metrics.BridgeErrors.WithLabelValues("empty_source_id", "bridge").Inc()
-		c.logAudit(ctx, tenant.ID, DirC2W, fmt.Sprintf("%d", env.ID), "", nil, "error", "empty_source_id", "contact_inbox.source_id is empty", 0)
-		return fmt.Errorf("bridge: empty source_id")
-	}
-	// Para Etapa 1, contact_map precisa estar populado (via `connect add-contact`).
-	// Verificamos se o JID é bem formado.
-	if !strings.Contains(jid, "@") {
-		jid = jid + "@s.whatsapp.net"
+		auditErr := c.logAudit(ctx, tenant.ID, DirC2W, fmt.Sprintf("%d", env.ID), "", nil, "error", "invalid_source_id", "source_id inválido", 0)
+		return errors.Join(fmt.Errorf("bridge: validate source_id: %w", jidErr), auditErr)
 	}
 
-	// 6. Idempotência
+	// 5. Reserva idempotente antes do efeito externo. Claims de processamento
+	// expiram rapidamente para permitir retomada após crash.
 	idempKey := fmt.Sprintf("c2w:%s:%d", tenant.Name, env.ID)
-	existing, found, err := c.Store.CheckIdempotency(ctx, string(DirC2W), idempKey)
+	claimToken := uuid.NewString()
+	claimState, err := c.Store.ClaimIdempotency(ctx, string(DirC2W), idempKey, tenant.ID, 2*time.Minute, claimToken)
 	if err != nil {
-		return fmt.Errorf("bridge: check idempotency: %w", err)
+		return fmt.Errorf("bridge: claim idempotency: %w", err)
 	}
-	if found {
+	switch claimState {
+	case store.ClaimCompleted:
 		metrics.IdempotencyHits.Inc()
 		metrics.BridgeMessages.WithLabelValues(string(DirC2W), "skipped_duplicate").Inc()
-		log.Info("bridge: duplicate skipped", "idemp_status", existing.Status)
-		return nil // idempotente: responde 200 sem reenviar
+		log.Info("bridge: duplicate skipped")
+		return nil
+	case store.ClaimInProgress:
+		metrics.IdempotencyHits.Inc()
+		return ErrInProgress
+	case store.ClaimAcquired:
+		// Continua para o efeito externo.
+	default:
+		return fmt.Errorf("bridge: unexpected idempotency state %q", claimState)
 	}
 
-	// 7. Envia via evolution-go
+	if c.LimitPerMin > 0 && !c.getLimiter(tenant.ID, DirC2W).Allow() {
+		metrics.BridgeMessages.WithLabelValues(string(DirC2W), "rate_limited").Inc()
+		metrics.BridgeErrors.WithLabelValues("rate_limited", "bridge").Inc()
+		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if err := c.Store.ReleaseIdempotency(persistCtx, string(DirC2W), idempKey, claimToken); err != nil {
+			return errors.Join(ErrRateLimited, err)
+		}
+		return ErrRateLimited
+	}
+
+	// 6. Envia via Evolution Go com o token individual da instância.
 	evo := evogo.NewClient(tenant.EvoBaseURL, tenant.EvoAPIKey)
-	number := strings.Split(jid, "@")[0] // evolution-go recebe só dígitos, sem @s.whatsapp.net
+	messageID := deterministicMessageID(tenant.ID, env.ID)
 
 	var err2 error
 	if len(env.Attachments) == 0 {
-		// Texto puro
-		_, err2 = evo.SendText(ctx, tenant.EvoInstanceName, number, env.Content)
+		_, err2 = evo.SendTextWithID(ctx, number, env.Content, messageID)
 	} else {
-		// Mídia: envia a primeira (Etapa 1 simplifica; Etapa 5 amplia)
 		att := env.Attachments[0]
 		mediaReq := evogo.SendMediaRequest{
-			Number:    number,
-			MediaType: normalizeMediaType(att.FileType),
-			Media:     att.FileURL,
-			FileName:  att.FileName,
-			Caption:   env.Content,
+			Number:   number,
+			URL:      att.DataURL,
+			Type:     normalizeMediaType(att.FileType),
+			Filename: attachmentFilename(att),
+			Caption:  env.Content,
+			ID:       messageID,
 		}
-		_, err2 = evo.SendMedia(ctx, tenant.EvoInstanceName, mediaReq)
+		_, err2 = evo.SendMedia(ctx, mediaReq)
 	}
 
 	latency := time.Since(start)
 	latencyMS := int(latency.Milliseconds())
 	if err2 != nil {
 		errCode := "evo_send_failed"
-		errDetail := err2.Error()
 		metrics.BridgeErrors.WithLabelValues(errCode, "bridge").Inc()
 		metrics.BridgeMessages.WithLabelValues(string(DirC2W), "error").Inc()
 		metrics.BridgeLatency.WithLabelValues(string(DirC2W)).Observe(latency.Seconds())
 		log.Error("bridge: evo send failed", "err", err2, "jid_masked", applog.MaskPhone(jid))
-		// Grava idempotência como failed + audit log
-		_ = c.Store.RecordIdempotency(ctx, string(DirC2W), idempKey, tenant.ID, "failed", []byte(errDetail), c.IdempotencyTTL)
-		c.logAudit(ctx, tenant.ID, DirC2W, fmt.Sprintf("%d", env.ID), jid, []byte(applog.ContentHash(env.Content)), "error", errCode, errDetail, latencyMS)
+		var transportErr *evogo.TransportError
+		if errors.As(err2, &transportErr) {
+			// Resultado ambíguo: mantém o claim até expirar. O retry usa o mesmo
+			// message ID no upstream para reduzir risco de duplicação.
+			return fmt.Errorf("bridge: evo send result unknown: %w", err2)
+		}
+		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		releaseErr := c.Store.ReleaseIdempotency(persistCtx, string(DirC2W), idempKey, claimToken)
+		auditErr := c.logAudit(persistCtx, tenant.ID, DirC2W, fmt.Sprintf("%d", env.ID), jid, []byte(applog.ContentHash(env.Content)), "error", errCode, "falha no envio ao upstream", latencyMS)
+		if releaseErr != nil || auditErr != nil {
+			return errors.Join(fmt.Errorf("bridge: evo send: %w", err2), releaseErr, auditErr)
+		}
 		return fmt.Errorf("bridge: evo send: %w", err2)
 	}
 
-	// 8. Sucesso — grava idempotência + audit
+	// 7. Sucesso — conclui a chave antes da auditoria. Uma falha crítica de
+	// persistência é propagada. Idempotência e auditoria são atômicas no DB.
 	detail := json.RawMessage(fmt.Sprintf(`{"latency_ms":%d}`, latencyMS))
-	_ = c.Store.RecordIdempotency(ctx, string(DirC2W), idempKey, tenant.ID, "sent", detail, c.IdempotencyTTL)
-	c.logAudit(ctx, tenant.ID, DirC2W, fmt.Sprintf("%d", env.ID), jid, []byte(applog.ContentHash(env.Content)), "ok", "", "", latencyMS)
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	auditEntry := c.newAuditEntry(tenant.ID, DirC2W, fmt.Sprintf("%d", env.ID), jid, []byte(applog.ContentHash(env.Content)), "ok", "", "", latencyMS)
+	if err := c.Store.CompleteDelivery(persistCtx, string(DirC2W), idempKey, claimToken, detail, c.IdempotencyTTL, auditEntry); err != nil {
+		return fmt.Errorf("bridge: complete delivery: %w", err)
+	}
 
 	metrics.BridgeMessages.WithLabelValues(string(DirC2W), "ok").Inc()
 	metrics.BridgeLatency.WithLabelValues(string(DirC2W)).Observe(latency.Seconds())
@@ -266,20 +284,37 @@ func (c *Core) HandleChatwootWebhook(ctx context.Context, env chatwoot.WebhookEn
 	return nil
 }
 
-func (c *Core) logAudit(ctx context.Context, tenantID uuid.UUID, dir Direction, extMsgID, jid string, payloadHash []byte, status, errCode, errDetail string, latencyMS int) {
-	if err := c.Store.LogBridge(ctx, store.BridgeLogEntry{
+func attachmentFilename(att chatwoot.Attachment) string {
+	if att.Extension == "" {
+		return ""
+	}
+	return "attachment." + strings.TrimPrefix(att.Extension, ".")
+}
+
+func (c *Core) logAudit(ctx context.Context, tenantID uuid.UUID, dir Direction, extMsgID, jid string, payloadHash []byte, status, errCode, errDetail string, latencyMS int) error {
+	if err := c.Store.LogBridge(ctx, c.newAuditEntry(tenantID, dir, extMsgID, jid, payloadHash, status, errCode, errDetail, latencyMS)); err != nil {
+		return fmt.Errorf("bridge: log audit: %w", err)
+	}
+	return nil
+}
+
+func (c *Core) newAuditEntry(tenantID uuid.UUID, dir Direction, extMsgID, jid string, payloadHash []byte, status, errCode, errDetail string, latencyMS int) store.BridgeLogEntry {
+	return store.BridgeLogEntry{
 		TenantID:          tenantID,
 		Direction:         string(dir),
 		ExternalMessageID: extMsgID,
-		JID:               jid,
+		JID:               applog.MaskPhone(jid),
 		PayloadSHA256:     payloadHash,
 		Status:            status,
 		ErrorCode:         errCode,
 		ErrorDetail:       errDetail,
 		LatencyMS:         latencyMS,
-	}); err != nil {
-		slog.Default().Error("bridge: log audit failed", "err", err, "tenant", tenantID)
 	}
+}
+
+func deterministicMessageID(tenantID uuid.UUID, chatwootMessageID int64) string {
+	digest := sha256.Sum256([]byte(fmt.Sprintf("%s:%d", tenantID, chatwootMessageID)))
+	return fmt.Sprintf("CW%X", digest[:15])
 }
 
 func normalizeMediaType(chatwootType string) string {

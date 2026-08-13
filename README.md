@@ -18,9 +18,16 @@ etapas).
 ## Status atual — Etapa 1
 
 - ✅ **Reverse bridge (Chatwoot → WhatsApp):** mensagem que o agente envia no
-  Chatwoot chega no WhatsApp do cliente, com idempotência, audit log e HMAC.
+  Chatwoot é enviada ao WhatsApp, com idempotência atômica, audit log e HMAC.
+- ✅ Contratos automatizados homologados para **Evolution Go 0.7.2** e
+  **Chatwoot 4.16.2**.
 - ⏳ Forward bridge (WhatsApp → Chatwoot) — Etapa 2.
+- ⏳ Stack final de produção para Coolify e smoke E2E em VPS — próxima etapa.
 - ⏳ Mídia rica, status updates, grupos — Etapas 5-7.
+
+O código da Etapa 1 possui testes de contrato, retry e concorrência. Antes de
+liberar uma VPS para tráfego real, execute `scripts/smoke-e2e.sh` contra as
+instâncias que serão usadas; o compose atual ainda é uma referência local.
 
 Ver `.context/plans/2026-08-12-evogo-chatwoot-connector.md` para o roadmap
 completo e `.context/research/` para a investigação.
@@ -70,7 +77,8 @@ make build
   --chatwoot-token <api_access_token> \
   --chatwoot-account 1 \
   --evo-url http://localhost:8080 \
-  --evo-key <GLOBAL_API_KEY> \
+  --evo-key <TOKEN_DA_INSTANCIA> \
+  --evo-instance demo \
   --connect-url http://localhost:9090
 
 # 8. Adicionar um contato (JID WhatsApp → contato Chatwoot)
@@ -81,6 +89,17 @@ make build
 
 Pronto. Quando um agente responder no Chatwoot, a mensagem chega no WhatsApp
 do João via evolution-go.
+
+## Compatibilidade
+
+| Componente | Versão homologada | Observação |
+|---|---:|---|
+| Evolution Go | 0.7.2 | `/send/text`, `/send/media`, `/instance/status`; token individual da instância |
+| Chatwoot | 4.16.2 | API inbox com `secret` e assinatura `timestamp.body` |
+| PostgreSQL | 16+ | Persistência, idempotência e auditoria |
+
+Outras versões não estão bloqueadas artificialmente, mas precisam passar pelo
+smoke E2E antes de uso em produção.
 
 ## Arquitetura
 
@@ -100,12 +119,15 @@ Detalhes em `docs/architecture.md`.
 
 ## Segurança
 
-- HMAC bidirecional (Chatwoot + evolution-go)
+- HMAC do webhook Chatwoot com janela anti-replay
 - Tokens armazenados AES-GCM criptografados no Postgres
 - Idempotência por `message_id` (evita duplicação em retries)
 - PII nunca em logs (telefone mascarado, content hasheado)
 - Audit log completo em `bridge_log`
 - Kill switch via `POST /admin/pause`
+
+O webhook Evolution Go → Chatwoot e sua autenticação serão adicionados na
+Etapa 2; eles não são anunciados nem configurados nesta entrega.
 
 Modelo completo em `docs/security.md`.
 

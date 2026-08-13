@@ -4,31 +4,40 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"strconv"
+	"strings"
+	"time"
 )
 
-// VerifySignature verifica a assinatura do webhook do Chatwoot.
-//
-// O Chatwoot, para API Channel inboxes, envia o token HMAC diretamente no
-// header `X-Chatwoot-Signature` (não um HMAC do body). Para máxima
-// compatibilidade, suportamos DOIS modos:
-//
-//   - Mode "plain": o header é comparado diretamente ao token (compara
-//     constant-time).
-//   - Mode "hmac":  o header é `hex(hmac_sha256(body, token))` (modo avançado,
-//     se o operador configurou manualmente no Chatwoot).
-//
-// `mode` pode ser "plain" (default) ou "hmac".
-func VerifySignature(headerValue, token, body, mode string) bool {
-	if headerValue == "" || token == "" {
+// VerifySignature valida o contrato de webhook do Chatwoot 4.16.2:
+// sha256=HMAC-SHA256(secret, timestamp+"."+body). O timestamp também limita
+// replay de mensagens antigas ou excessivamente adiantadas.
+func VerifySignature(headerValue, timestamp, secret string, body []byte, now time.Time, replayWindow time.Duration) bool {
+	if headerValue == "" || timestamp == "" || secret == "" || replayWindow <= 0 {
 		return false
 	}
-	switch mode {
-	case "hmac":
-		mac := hmac.New(sha256.New, []byte(token))
-		mac.Write([]byte(body))
-		expected := hex.EncodeToString(mac.Sum(nil))
-		return hmac.Equal([]byte(expected), []byte(headerValue))
-	default: // "plain"
-		return hmac.Equal([]byte(headerValue), []byte(token))
+
+	unixTimestamp, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil {
+		return false
 	}
+	delta := now.Sub(time.Unix(unixTimestamp, 0))
+	if delta < -replayWindow || delta > replayWindow {
+		return false
+	}
+
+	digestHex, ok := strings.CutPrefix(headerValue, "sha256=")
+	if !ok {
+		return false
+	}
+	provided, err := hex.DecodeString(digestHex)
+	if err != nil || len(provided) != sha256.Size {
+		return false
+	}
+
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(timestamp))
+	_, _ = mac.Write([]byte("."))
+	_, _ = mac.Write(body)
+	return hmac.Equal(mac.Sum(nil), provided)
 }

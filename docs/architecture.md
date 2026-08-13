@@ -2,15 +2,18 @@
 
 ## Visão geral
 
-O `evogo-connect` é um bridge HTTP bidirecional entre dois sistemas:
+O `evogo-connect` será um bridge HTTP bidirecional entre dois sistemas. Na
+Etapa 1, somente o sentido Chatwoot → WhatsApp está ativo:
 
 - **evolution-go** (provedor WhatsApp via whatsmeow) — REST + WebSocket
 - **Chatwoot** (plataforma de atendimento self-hosted) — REST + Webhooks
 
-O connector **não** altera o código de nenhum dos dois lados. Apenas:
-- Configura um webhook URL no evolution-go (apontando pro nosso `/webhook/evo/<instance>`)
-- Cria uma inbox API no Chatwoot (apontando pro nosso `/webhook/chatwoot`)
-- Persiste tokens e mapeamentos no Postgres
+O connector **não** altera o código de nenhum dos dois lados. Nesta etapa ele:
+
+- Cria uma inbox API no Chatwoot apontando para `/webhook/chatwoot`.
+- Persiste o `secret` da inbox e o token individual da instância Evolution Go.
+- Cria o contato e o vínculo `contact_inbox` com `source_id = JID`.
+- Não configura webhook de entrada no Evolution Go até a Etapa 2.
 
 ## Diagrama
 
@@ -71,25 +74,26 @@ cmd/connect-cli/main.go     — CLI de provisionamento
 4. **bridge.Core.HandleChatwootWebhook** (`internal/bridge/bridge.go`):
    - Checa kill switch (env + DB)
    - Filtra: `message_created` + `outgoing` + `!private`
-   - Re-valida HMAC (defesa em profundidade)
    - Resolve JID via `conversation.contact_inbox.source_id`
-   - Idempotência: `CheckIdempotency("c2w", key)` — se já enviado, responde 200 sem reenviar
+   - Adquire atomicamente o claim de idempotência antes do envio
    - Cria `evogo.Client`, chama `SendText` ou `SendMedia`
-   - Grava `RecordIdempotency` + `bridge_log` (sem PII)
+   - Conclui o claim e grava `bridge_log` sem PII; falha de envio libera retry
    - Retorna 200 (ou 503 se pausado)
-5. **evolution-go** recebe o POST `/message/sendText/{instance}` e entrega
+5. **Evolution Go** recebe `POST /send/text` ou `POST /send/media`, autenticado
+   pelo token individual da instância, e entrega
    via whatsmeow.
 6. **Cliente** recebe a mensagem no WhatsApp.
 
-Retry do Chatwoot: se a resposta for != 2xx, Chatwoot retenta (5x por
-padrão, com backoff). Idempotency garante que retries não duplicam.
+No Chatwoot 4.16.2, API inbox não oferece retry automático confiável. Se um
+webhook for reenviado manualmente ou por automação externa, a idempotência
+garante que uma entrega concluída não seja duplicada; claims ainda em
+processamento retornam erro reenviável, não um falso 200.
 
 ## Fluxo: cliente manda msg WhatsApp → agente recebe no Chatwoot (Etapa 2 — futuro)
 
 (planejado; ainda não implementado)
 
-1. evolution-go dispara `MESSAGES_UPSERT` no webhook configurado em
-   `/webhook/evo/<instance>`.
+1. Evolution Go dispara eventos no webhook que será configurado na Etapa 2.
 2. evogo-connect valida `X-Evogo-Secret` (replay window 5 min).
 3. Get-or-create contact no Chatwoot com `source_id = remoteJid`.
 4. Get-or-create conversation (status=open).

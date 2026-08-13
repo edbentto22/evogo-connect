@@ -13,8 +13,8 @@
 | Go | 1.25+ | Compilar os binários |
 | Docker + docker compose | 24+ | Postgres + deploy |
 | PostgreSQL | 16+ | Idempotência, audit log, config |
-| Chatwoot | 3.x+ self-hosted | Caixa de entrada API + UI do agente |
-| evolution-go | latest | Provedor WhatsApp (roda standalone) |
+| Chatwoot | 4.16.2 | Versão homologada da inbox API e assinatura de webhook |
+| Evolution Go | 0.7.2 | Versão homologada das rotas `/send/*` |
 
 > **Não precisa** de Redis, Kafka, nem nada extra. É um único binário Go + Postgres.
 
@@ -85,7 +85,7 @@ curl -s http://localhost:9090/metrics | head -5   # métricas Prometheus
 > - `api_access_token` do Chatwoot (Profile → Access Token no Chatwoot)
 > - ID da account do Chatwoot (default `1`)
 > - URL do evolution-go (ex: `http://localhost:8080`)
-> - `GLOBAL_API_KEY` do evolution-go (env dele)
+> - Token individual da instância Evolution Go (não a chave global)
 > - Nome da instância no evolution-go (ex: `demo`, pareada com QR)
 > - URL pública deste connector (ex: `https://evogo.empresa.com` — pra
 >   onde o Chatwoot vai mandar webhooks)
@@ -97,7 +97,7 @@ curl -s http://localhost:9090/metrics | head -5   # métricas Prometheus
   --chatwoot-token "$CW_TOKEN" \
   --chatwoot-account 1 \
   --evo-url http://localhost:8080 \
-  --evo-key "$EVO_KEY" \
+  --evo-key "$EVO_INSTANCE_TOKEN" \
   --evo-instance demo \
   --connect-url https://evogo.empresa.com
 ```
@@ -105,8 +105,8 @@ curl -s http://localhost:9090/metrics | head -5   # métricas Prometheus
 Saída esperada:
 
 ```
+✓ Token da instância Evolution Go validado: demo
 ✓ Inbox criada no Chatwoot: id=7
-✓ Webhook configurado no evolution-go: https://evogo.empresa.com/webhook/evo/demo
 ✓ Tenant 'demo' registrado (id=...)
 
 Próximo passo — adicione um contato:
@@ -115,8 +115,12 @@ Próximo passo — adicione um contato:
 
 O que aconteceu:
 1. **Inbox API no Chatwoot** foi criada com `webhook_url = https://evogo.empresa.com/webhook/chatwoot` e HMAC obrigatório.
-2. **Webhook do evolution-go** foi configurado pra apontar pra `https://evogo.empresa.com/webhook/evo/demo` com eventos `MESSAGES_UPSERT`, `MESSAGES_UPDATE`, `CONNECTION_UPDATE`.
-3. **Tenant persistido** no Postgres (tokens cifrados com `CONNECT_MASTER_KEY`).
+2. O campo top-level **`secret`** retornado pelo Chatwoot foi persistido para validar `X-Chatwoot-Signature` e `X-Chatwoot-Timestamp`.
+3. O token individual da instância Evolution Go foi validado em `/instance/status`.
+4. **Tenant persistido** no Postgres (tokens cifrados com `CONNECT_MASTER_KEY`).
+
+O webhook Evolution Go → Chatwoot não é configurado nesta etapa, pois o
+handler seguro desse sentido será entregue na Etapa 2.
 
 ---
 
@@ -133,8 +137,9 @@ O que aconteceu:
   --name "João da Silva"
 ```
 
-Isso cria o contato no Chatwoot (com `source_id = JID`) e salva o
-mapeamento no `contact_map`. Pronto — o agente já pode responder e a
+Isso cria ou reutiliza o contato pelo campo `identifier`, garante um
+`contact_inbox` cujo `source_id` é exatamente o JID e salva o mapeamento no
+`contact_map`. Pronto — o agente já pode responder e a
 mensagem vai chegar no WhatsApp do João.
 
 ### Adicionar mais contatos
@@ -166,16 +171,23 @@ Repita o comando pra cada JID que você quer atender. Pra listar:
 
 ### 5.2. Validar idempotência (simulando retry do Chatwoot)
 
-O Chatwoot retenta webhooks em 5x se a resposta for != 2xx. Nosso
-conector é idempotente — duplicatas são descartadas.
+O Chatwoot 4.16.2 não faz retry automático confiável para webhooks de API
+inbox: ele pode marcar a mensagem como `failed`. Nosso conector é idempotente
+quando o mesmo webhook é reenviado, mas o reenvio deve ser acionado pelo
+operador/Chatwoot ou por uma automação externa.
 
 ```bash
 # Disparar o mesmo webhook 3 vezes (mesmo chatwoot_message_id)
-WEBHOOK_BODY='{"event":"message_created","message_type":"outgoing","id":99999,...}'
+WEBHOOK_BODY='{"event":"message_created","message_type":"outgoing","id":99999,"content":"teste","private":false,"inbox_id":7,"conversation":{"inbox_id":7,"contact_inbox":{"inbox_id":7,"source_id":"5511999999999@s.whatsapp.net"}}}'
 for i in 1 2 3; do
+  TIMESTAMP=$(date +%s)
+  SIGNATURE=$(printf '%s.%s' "$TIMESTAMP" "$WEBHOOK_BODY" \
+    | openssl dgst -sha256 -hmac "$CHATWOOT_WEBHOOK_SECRET" -hex \
+    | sed 's/^.*= /sha256=/')
   curl -X POST https://evogo.empresa.com/webhook/chatwoot \
     -H "Content-Type: application/json" \
-    -H "X-Chatwoot-Signature: $HMAC_TOKEN" \
+    -H "X-Chatwoot-Timestamp: $TIMESTAMP" \
+    -H "X-Chatwoot-Signature: $SIGNATURE" \
     -d "$WEBHOOK_BODY"
 done
 
@@ -192,7 +204,7 @@ curl -s https://evogo.empresa.com/metrics | grep idempotency
 # → ✓ Bridge pausado
 
 # Tentar responder como agente → WhatsApp NÃO recebe (webhook retorna 503)
-# Chatwoot retenta 5x em 30s, todos falham — não envia
+# O Chatwoot pode marcar a mensagem como failed; reenvie após retomar o bridge
 
 # Verificar
 ./bin/connect status
@@ -216,7 +228,12 @@ psql postgres://connect:connect@localhost:5432/evogo_connect \
 
 ---
 
-## 6. Deploy em produção
+## 6. Deploy de referência
+
+O compose em `deploy/` é adequado para desenvolvimento e homologação. O
+pacote final para Coolify, com segredos, healthcheck e exposição de portas
+endurecidos, pertence à próxima etapa e deve ser concluído antes da VPS de
+produção receber tráfego real.
 
 ### 6.1. Stack completa (docker-compose)
 
@@ -230,7 +247,7 @@ cp deploy/.env.example .env
 echo "CONNECT_MASTER_KEY=$(openssl rand -base64 32)" >> .env
 echo "ADMIN_TOKEN=$(openssl rand -hex 32)" >> .env
 
-# Subir tudo
+# Subir o ambiente de homologação
 docker compose -f deploy/docker-compose.yml up -d
 
 # Verificar
@@ -276,6 +293,15 @@ bridge precisa ser reprovisionado.
 docker compose -f deploy/docker-compose.yml pull
 docker compose -f deploy/docker-compose.yml up -d
 # Migrations rodam automaticamente na inicialização.
+
+# Obrigatório ao migrar tenants criados por versões anteriores: o mesmo nome
+# atualiza o secret da inbox e troca a chave global pelo token da instância.
+./bin/connect setup --name demo \
+  --chatwoot-url https://chatwoot.empresa.com \
+  --chatwoot-token "$CW_TOKEN" --chatwoot-account 1 \
+  --evo-url http://localhost:8080 \
+  --evo-key "$EVO_INSTANCE_TOKEN" --evo-instance demo \
+  --connect-url https://evogo.empresa.com
 ```
 
 ---
@@ -288,7 +314,7 @@ docker compose -f deploy/docker-compose.yml up -d
 |---|---|
 | `./bin/connect list` | Lista tenants configurados |
 | `./bin/connect status` | Estado do bridge + últimas 5 do audit log |
-| `./bin/connect pause --reason "..."` | Mata o bridge (Chatwoot retenta) |
+| `./bin/connect pause --reason "..."` | Pausa o bridge; mensagens podem ficar `failed` no Chatwoot |
 | `./bin/connect resume` | Liga o bridge |
 | `curl /admin/tenants -H "X-Admin-Token: ..."` | Lista via API (debug) |
 | `curl /admin/paused` | Status do kill switch |
@@ -338,21 +364,21 @@ scrape_configs:
    ```sql
    SELECT * FROM bridge_log WHERE status='error' ORDER BY created_at DESC LIMIT 5;
    ```
-4. evolution-go tá conectado? `curl -H "apikey: $EVO_KEY" http://evo:8080/instance/status/demo`
-5. Webhook do evolution-go configurado? `curl -H "apikey: $EVO_KEY" http://evo:8080/webhook/find/demo`
-6. Teste manual:
+4. Evolution Go está conectado? `curl -H "apikey: $EVO_INSTANCE_TOKEN" http://evo:8080/instance/status`
+5. Teste manual:
    ```bash
-   curl -X POST http://evo:8080/message/sendText/demo \
-     -H "apikey: $EVO_KEY" -H "Content-Type: application/json" \
+   curl -X POST http://evo:8080/send/text \
+     -H "apikey: $EVO_INSTANCE_TOKEN" -H "Content-Type: application/json" \
      -d '{"number":"5511999999999","text":"teste"}'
    ```
 
 ### "Chatwoot retorna 401 no webhook"
 
-1. `X-Chatwoot-Signature` confere com o token gravado no DB?
-2. Conferir token no Chatwoot: `GET /api/v1/accounts/{id}/inboxes/{inbox_id}` → campo `channel.hmac_token`.
-3. Comparar com `tenants.chatwoot_hmac_enc` (decifrado em runtime).
-4. Métrica: `bridge_errors_total{code="hmac_invalid"}` deve estar > 0.
+1. O relógio da VPS está sincronizado? A janela padrão é 5 minutos.
+2. Conferir o campo top-level `secret` no retorno de `GET /api/v1/accounts/{id}/inboxes/{inbox_id}`.
+3. Confirmar que ele corresponde ao valor cifrado em `tenants.chatwoot_hmac_enc`.
+4. Verificar os headers `X-Chatwoot-Timestamp` e `X-Chatwoot-Signature: sha256=...`.
+5. Métrica: `bridge_errors_total{code="hmac_invalid"}` deve estar > 0.
 
 ### "Postgres crescendo muito"
 
@@ -374,7 +400,7 @@ Recomendado: pg_cron para automatizar (Etapa 6).
   --chatwoot-token "$CW_TOKEN" \
   --chatwoot-account 1 \
   --evo-url http://localhost:8080 \
-  --evo-key "$EVO_KEY" \
+  --evo-key "$EVO_INSTANCE_TOKEN" \
   --evo-instance loja2 \
   --connect-url https://evogo.empresa.com
 

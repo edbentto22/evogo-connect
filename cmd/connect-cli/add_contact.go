@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/edbentto22/evogo-connect/internal/chatwoot"
+	"github.com/edbentto22/evogo-connect/internal/evogo"
 	"github.com/edbentto22/evogo-connect/internal/store"
 )
 
@@ -57,38 +59,53 @@ func runAddContact(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("tenant '%s' não encontrado: %w", flagTenant, err)
 	}
 
-	// Normaliza JID
-	jid := strings.TrimSpace(flagJID)
-	if !strings.Contains(jid, "@") {
-		jid = jid + "@s.whatsapp.net"
+	// Normaliza e valida JID individual (grupos não fazem parte desta etapa).
+	jid, _, err := evogo.ParseDirectJID(flagJID)
+	if err != nil {
+		return fmt.Errorf("validate JID: %w", err)
 	}
 
-	// Cria contato no Chatwoot
+	// Busca ou cria o contato pelo identifier estável.
 	cw := chatwootClientFor(tenant)
-	contact, err := cw.CreateContact(ctx, tenant.ChatwootInboxID, flagName, jid)
+	contact, err := cw.FindContactByIdentifier(ctx, jid)
 	if err != nil {
-		// Pode já existir (dedup por source_id)
-		existing, err2 := cw.FindContactBySourceID(ctx, tenant.ChatwootInboxID, jid)
-		if err2 != nil {
-			return fmt.Errorf("create contact: %w", err)
+		if !errors.Is(err, chatwoot.ErrNotFound) {
+			return fmt.Errorf("find contact: %w", err)
 		}
-		contact = existing
-		fmt.Printf("• Contato já existia (id=%d)\n", contact.ID)
-	} else {
+		contact, err = cw.CreateContact(ctx, flagName, jid)
+		if err != nil {
+			createErr := err
+			// Trata uma criação concorrente buscando novamente pelo identifier.
+			contact, err = cw.FindContactByIdentifier(ctx, jid)
+			if err != nil {
+				return errors.Join(fmt.Errorf("create contact: %w", createErr), fmt.Errorf("refetch contact: %w", err))
+			}
+		}
 		fmt.Printf("✓ Contato criado no Chatwoot: id=%d\n", contact.ID)
+	} else {
+		fmt.Printf("• Contato já existia (id=%d)\n", contact.ID)
 	}
+
+	contactInbox, err := cw.EnsureContactInbox(ctx, contact, tenant.ChatwootInboxID, jid)
+	if err != nil {
+		return fmt.Errorf("ensure contact inbox: %w", err)
+	}
+	if contactInbox.SourceID != jid {
+		return fmt.Errorf("ensure contact inbox: source_id mismatch")
+	}
+	fmt.Println("✓ Vínculo com a inbox confirmado")
 
 	// Persiste mapeamento
 	cm := &store.ContactMap{
 		TenantID:          tenant.ID,
 		JID:               jid,
 		ChatwootContactID: contact.ID,
-		SourceID:          contact.SourceID,
+		SourceID:          jid,
 		DisplayName:       flagName,
 	}
 	if err := st.CreateContact(ctx, cm); err != nil {
 		return fmt.Errorf("persist contact map: %w", err)
 	}
-	fmt.Printf("✓ Mapeamento salvo: %s → chatwoot_contact_id=%d\n", jid, contact.ID)
+	fmt.Printf("✓ Mapeamento salvo para chatwoot_contact_id=%d\n", contact.ID)
 	return nil
 }

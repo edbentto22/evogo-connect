@@ -7,8 +7,8 @@
 
 | Sentido | Mecanismo |
 |---|---|
-| Chatwoot → evogo-connect | Header `X-Chatwoot-Signature` comparado com `tenants.chatwoot_hmac` (constant-time). Modo `plain` (default) ou `hmac` (HMAC-SHA256 do body). |
-| evogo-connect → evolution-go | Header `apikey: <GLOBAL_API_KEY>` por tenant (env não-global, escopado). |
+| Chatwoot → evogo-connect | `X-Chatwoot-Signature: sha256=<digest>` validado em tempo constante sobre `X-Chatwoot-Timestamp + "." + body`, com janela de 5 minutos. |
+| evogo-connect → Evolution Go | Header `apikey` recebe o token individual da instância; a chave global não é aceita no fluxo de envio. |
 | evolution-go → evogo-connect (Etapa 2) | Header `X-Evogo-Secret` validado por tenant; replay window 5 min. |
 | Admin (`/admin/*`) | Header `X-Admin-Token` (config). Token NUNCA em log. |
 
@@ -48,12 +48,17 @@ por chave `(direction, key)`:
 
 TTL: `IDEMPOTENCY_TTL` (default 24h). Chave expirada é sobrescrita.
 
+O claim `processing` é adquirido atomicamente antes do envio. Duplicatas
+concorrentes não executam o efeito externo. Uma falha de envio muda o claim
+para `failed`, permitindo retry; uma entrega concluída fica terminal como
+`sent` até o TTL.
+
 ## 5. Audit log
 
 Tabela `bridge_log` — **sem conteúdo**:
 - IDs externos (chatwoot_message_id, evo_message_id)
 - Direção (`c2w` / `w2c`)
-- JID (texto, mas só pra auditoria interna; nunca expor)
+- JID mascarado (nunca o valor completo)
 - SHA256 do payload (correlação)
 - Status, error_code, latency_ms
 - Timestamp
@@ -72,11 +77,13 @@ Default 120 msg/min. Excedente → 429 + log + métrica.
 - Via DB: `INSERT INTO bridge_paused VALUES (1, ...)`. Toggle on-the-fly
   via `POST /admin/pause` (header `X-Admin-Token`).
 
-Quando pausado, webhooks do Chatwoot retornam **503** (Chatwoot retenta).
+Quando pausado, webhooks do Chatwoot retornam **503**. Em API inbox do
+Chatwoot 4.16.2, isso pode marcar a mensagem como `failed` sem retry automático;
+o operador precisa reenviá-la após retomar o bridge.
 
 ## 8. Tamanho máximo de body
 
-Webhook do Chatwoot tem `io.LimitReader(c.Request.Body, 5*1024*1024)` (5 MB).
+Webhook do Chatwoot usa `http.MaxBytesReader` com limite de 5 MB.
 Acima disso → 400 Bad Request antes de processar.
 
 ## 9. TLS na borda

@@ -77,21 +77,22 @@ psql -c "SELECT direction, key, status, created_at FROM idempotency
    ```
 4. Confirmar que evolution-go está conectado:
    ```bash
-   curl -H "apikey: $KEY" http://localhost:8080/instance/status/demo
+   curl -H "apikey: $EVO_INSTANCE_TOKEN" http://localhost:8080/instance/status
    ```
 5. Verificar logs do evolution-go: o webhook chegou lá?
 6. Testar envio manual:
    ```bash
-   curl -X POST http://localhost:8080/message/sendText/demo \
-     -H "apikey: $KEY" -H "Content-Type: application/json" \
+   curl -X POST http://localhost:8080/send/text \
+     -H "apikey: $EVO_INSTANCE_TOKEN" -H "Content-Type: application/json" \
      -d '{"number":"5511999999999","text":"teste"}'
    ```
 
 ### "Chatwoot retorna 401 no webhook"
 
-1. Conferir HMAC token no Chatwoot: `GET /api/v1/accounts/{id}/inboxes/{inbox_id}`
-2. Comparar com `tenants.chatwoot_hmac_enc` no DB.
-3. Ver `bridge_errors_total{code="hmac_invalid"}`.
+1. Conferir o campo top-level `secret` no retorno de `GET /api/v1/accounts/{id}/inboxes/{inbox_id}`.
+2. Confirmar que esse segredo foi persistido cifrado em `tenants.chatwoot_hmac_enc`.
+3. Conferir se o relógio da VPS está sincronizado; a tolerância padrão é 5 minutos.
+4. Ver `bridge_errors_total{code="hmac_invalid"}`.
 
 ### "Postgres lotado"
 
@@ -111,7 +112,7 @@ connect setup --name loja2 \
   --chatwoot-token $CW_TOKEN \
   --chatwoot-account 1 \
   --evo-url http://localhost:8080 \
-  --evo-key $EVO_KEY \
+  --evo-key $EVO_INSTANCE_TOKEN \
   --evo-instance loja2 \
   --connect-url https://evogo-connect.example.com
 
@@ -134,6 +135,12 @@ pg_restore -d evogo_connect backup-2026-08-12.dump
 ```
 
 ## Upgrade
+
+Tenants criados por versões anteriores guardavam `hmac_token` e a chave global
+do Evolution Go. Depois de subir a nova imagem, execute novamente `connect
+setup` com o **mesmo `--name`**, o token individual da instância e as
+credenciais atuais do Chatwoot. O comando atualiza o tenant e reutiliza a inbox,
+sem perder contatos nem IDs locais.
 
 ```bash
 # 1. Puxar imagem nova

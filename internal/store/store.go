@@ -67,6 +67,14 @@ func (s *Store) Pool() *pgxpool.Pool {
 	return s.pool
 }
 
+// Ping verifica a conectividade sem expor o pool aos handlers HTTP.
+func (s *Store) Ping(ctx context.Context) error {
+	if err := s.pool.Ping(ctx); err != nil {
+		return fmt.Errorf("store: ping: %w", err)
+	}
+	return nil
+}
+
 // ─── Tenants ──────────────────────────────────────────────────────────────
 
 // Tenant representa um par (Chatwoot inbox) ↔ (evolution-go instance).
@@ -123,6 +131,44 @@ func (s *Store) CreateTenant(ctx context.Context, t *Tenant) error {
 		tokEnc, hmacEnc, t.EvoInstanceName, t.EvoBaseURL, evoKeyEnc, evoSecretEnc)
 	if err != nil {
 		return fmt.Errorf("store: insert tenant: %w", err)
+	}
+	return nil
+}
+
+// UpdateTenantIntegration atualiza credenciais e metadados de um tenant já
+// existente, preservando seu ID, inbox e relacionamentos locais.
+func (s *Store) UpdateTenantIntegration(ctx context.Context, t *Tenant) error {
+	chatwootTokenEnc, err := s.cipher.EncryptString(t.ChatwootToken)
+	if err != nil {
+		return fmt.Errorf("store: encrypt chatwoot token: %w", err)
+	}
+	chatwootSecretEnc, err := s.cipher.EncryptString(t.ChatwootHMAC)
+	if err != nil {
+		return fmt.Errorf("store: encrypt chatwoot secret: %w", err)
+	}
+	evoTokenEnc, err := s.cipher.EncryptString(t.EvoAPIKey)
+	if err != nil {
+		return fmt.Errorf("store: encrypt evo token: %w", err)
+	}
+
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE tenants SET
+			chatwoot_account_id = $2,
+			chatwoot_base_url = $3,
+			chatwoot_token_enc = $4,
+			chatwoot_hmac_enc = $5,
+			evo_instance_name = $6,
+			evo_base_url = $7,
+			evo_api_key_enc = $8,
+			updated_at = now()
+		WHERE id = $1
+	`, t.ID, t.ChatwootAccountID, t.ChatwootBaseURL, chatwootTokenEnc,
+		chatwootSecretEnc, t.EvoInstanceName, t.EvoBaseURL, evoTokenEnc)
+	if err != nil {
+		return fmt.Errorf("store: update tenant integration: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrNotFound
 	}
 	return nil
 }
@@ -234,6 +280,10 @@ func (s *Store) CreateContact(ctx context.Context, c *ContactMap) error {
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO contact_map (id, tenant_id, jid, chatwoot_contact_id, source_id, display_name)
 		VALUES ($1,$2,$3,$4,$5,$6)
+		ON CONFLICT (tenant_id, jid) DO UPDATE SET
+			chatwoot_contact_id = EXCLUDED.chatwoot_contact_id,
+			source_id = EXCLUDED.source_id,
+			display_name = EXCLUDED.display_name
 	`, c.ID, c.TenantID, c.JID, c.ChatwootContactID, c.SourceID, c.DisplayName)
 	if err != nil {
 		return fmt.Errorf("store: insert contact: %w", err)
@@ -260,40 +310,101 @@ func (s *Store) GetContactByJID(ctx context.Context, tenantID uuid.UUID, jid str
 
 // ─── Idempotency ──────────────────────────────────────────────────────────
 
-// IdempotencyResult é o resultado de uma checagem de idempotência.
-type IdempotencyResult struct {
-	Status string
-	Detail []byte // JSONB cru
-}
+// IdempotencyClaim descreve o estado observado ao adquirir uma chave.
+type IdempotencyClaim string
 
-// CheckIdempotency retorna (result, found). Se found=true, o request já foi
-// processado e o caller deve responder igual ao anterior.
-func (s *Store) CheckIdempotency(ctx context.Context, direction, key string) (*IdempotencyResult, bool, error) {
+const (
+	ClaimAcquired   IdempotencyClaim = "acquired"
+	ClaimInProgress IdempotencyClaim = "in_progress"
+	ClaimCompleted  IdempotencyClaim = "completed"
+)
+
+// ClaimIdempotency tenta reservar atomicamente uma chave antes do efeito
+// externo. Claims falhos ou expirados podem ser retomados.
+func (s *Store) ClaimIdempotency(ctx context.Context, direction, key string, tenantID uuid.UUID, ttl time.Duration, claimToken string) (IdempotencyClaim, error) {
 	row := s.pool.QueryRow(ctx, `
-		SELECT status, detail FROM idempotency
-		WHERE direction = $1 AND key = $2 AND expires_at > now()
-	`, direction, key)
-	var r IdempotencyResult
-	var detail []byte
-	if err := row.Scan(&r.Status, &detail); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, false, nil
+		INSERT INTO idempotency (key, direction, tenant_id, status, detail, expires_at)
+		VALUES ($1,$2,$3,'processing',jsonb_build_object('claim_token',$5), now() + $4::interval)
+		ON CONFLICT (direction, key) DO UPDATE SET
+			tenant_id = EXCLUDED.tenant_id,
+			status = 'processing',
+			detail = EXCLUDED.detail,
+			created_at = now(),
+			expires_at = EXCLUDED.expires_at
+		WHERE idempotency.status = 'failed' OR idempotency.expires_at <= now()
+		RETURNING true
+	`, key, direction, tenantID, ttl.String(), claimToken)
+	var claimed bool
+	if err := row.Scan(&claimed); err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return "", fmt.Errorf("store: claim idempotency: %w", err)
 		}
-		return nil, false, fmt.Errorf("store: check idempotency: %w", err)
+		var status string
+		if err := s.pool.QueryRow(ctx, `
+			SELECT status FROM idempotency WHERE direction = $1 AND key = $2
+		`, direction, key).Scan(&status); err != nil {
+			return "", fmt.Errorf("store: read idempotency state: %w", err)
+		}
+		if status == "sent" {
+			return ClaimCompleted, nil
+		}
+		return ClaimInProgress, nil
 	}
-	r.Detail = detail
-	return &r, true, nil
+	if !claimed {
+		return "", errors.New("store: claim idempotency returned invalid state")
+	}
+	return ClaimAcquired, nil
 }
 
-// RecordIdempotency grava a chave com TTL.
-func (s *Store) RecordIdempotency(ctx context.Context, direction, key string, tenantID uuid.UUID, status string, detail []byte, ttl time.Duration) error {
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO idempotency (key, direction, tenant_id, status, detail, expires_at)
-		VALUES ($1,$2,$3,$4,$5, now() + $6::interval)
-		ON CONFLICT (direction, key) DO UPDATE SET status = EXCLUDED.status, detail = EXCLUDED.detail
-	`, key, direction, tenantID, status, detail, ttl.String())
+// CompleteDelivery marca o claim como entregue e grava sua auditoria na mesma
+// transação, evitando estado sent sem trilha de auditoria.
+func (s *Store) CompleteDelivery(ctx context.Context, direction, key, claimToken string, detail []byte, ttl time.Duration, entry BridgeLogEntry) error {
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("store: record idempotency: %w", err)
+		return fmt.Errorf("store: begin delivery completion: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE idempotency
+		SET status = 'sent', detail = $3, expires_at = now() + $4::interval
+		WHERE direction = $1 AND key = $2 AND status = 'processing'
+		  AND detail->>'claim_token' = $5
+	`, direction, key, detail, ttl.String(), claimToken)
+	if err != nil {
+		return fmt.Errorf("store: complete idempotency: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return errors.New("store: complete delivery: active claim not found")
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO bridge_log (tenant_id, direction, external_message_id, jid,
+		                       payload_sha256, status, error_code, error_detail, latency_ms)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+	`, entry.TenantID, entry.Direction, entry.ExternalMessageID, entry.JID,
+		entry.PayloadSHA256, entry.Status, nullIfEmpty(entry.ErrorCode), nullIfEmpty(entry.ErrorDetail), entry.LatencyMS)
+	if err != nil {
+		return fmt.Errorf("store: insert delivery audit: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("store: commit delivery completion: %w", err)
+	}
+	return nil
+}
+
+// ReleaseIdempotency torna uma tentativa falha imediatamente reenviável.
+func (s *Store) ReleaseIdempotency(ctx context.Context, direction, key, claimToken string) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE idempotency
+		SET status = 'failed', detail = '{}'::jsonb
+		WHERE direction = $1 AND key = $2 AND status = 'processing'
+		  AND detail->>'claim_token' = $3
+	`, direction, key, claimToken)
+	if err != nil {
+		return fmt.Errorf("store: release idempotency: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return errors.New("store: release idempotency: active claim not found")
 	}
 	return nil
 }

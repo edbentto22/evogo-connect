@@ -7,133 +7,129 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
-// Client é o cliente HTTP do evolution-go.
+const maxResponseBody = 1 << 20
+
+// HTTPError representa uma resposta não-2xx sem expor o corpo do upstream.
+type HTTPError struct {
+	Method     string
+	Path       string
+	StatusCode int
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("evogo: %s %s returned status %d", e.Method, e.Path, e.StatusCode)
+}
+
+// TransportError preserva a causa sem expor a URL configurada em logs.
+type TransportError struct {
+	Err error
+}
+
+func (e *TransportError) Error() string { return "evogo: upstream transport failed" }
+func (e *TransportError) Unwrap() error { return e.Err }
+
+// Client é o cliente HTTP do Evolution Go 0.7.2.
 type Client struct {
 	baseURL    string
-	apiKey     string
+	token      string
 	httpClient *http.Client
 }
 
-// NewClient cria um client. apiKey = GLOBAL_API_KEY do evolution-go.
-func NewClient(baseURL, apiKey string) *Client {
+// NewClient cria um client autenticado pelo token individual da instância.
+func NewClient(baseURL, instanceToken string) *Client {
 	return &Client{
-		baseURL: baseURL,
-		apiKey:  apiKey,
+		baseURL: strings.TrimRight(baseURL, "/"),
+		token:   instanceToken,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
 	}
 }
 
-// ─── Send ────────────────────────────────────────────────────────────────
-
 // SendText envia uma mensagem de texto.
-func (c *Client) SendText(ctx context.Context, instance, number, text string) (*SendTextResponse, error) {
-	payload := SendTextRequest{
-		Number: number,
-		Text:   text,
-	}
+func (c *Client) SendText(ctx context.Context, number, message string) (*SendTextResponse, error) {
+	return c.SendTextWithID(ctx, number, message, "")
+}
+
+// SendTextWithID envia texto com um ID determinístico, permitindo que o
+// upstream reconheça uma repetição após falha entre envio e persistência.
+func (c *Client) SendTextWithID(ctx context.Context, number, message, id string) (*SendTextResponse, error) {
+	payload := SendTextRequest{Number: number, Text: message, ID: id}
 	var out SendTextResponse
-	path := fmt.Sprintf("/message/sendText/%s", instance)
-	if err := c.do(ctx, http.MethodPost, path, payload, &out); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/send/text", payload, &out); err != nil {
 		return nil, fmt.Errorf("evogo: send text: %w", err)
 	}
 	return &out, nil
 }
 
-// SendMedia envia mídia (URL ou base64).
-func (c *Client) SendMedia(ctx context.Context, instance string, req SendMediaRequest) (*SendTextResponse, error) {
+// SendMedia envia uma mídia por URL.
+func (c *Client) SendMedia(ctx context.Context, req SendMediaRequest) (*SendTextResponse, error) {
 	var out SendTextResponse
-	path := fmt.Sprintf("/message/sendMedia/%s", instance)
-	if err := c.do(ctx, http.MethodPost, path, req, &out); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/send/media", req, &out); err != nil {
 		return nil, fmt.Errorf("evogo: send media: %w", err)
 	}
 	return &out, nil
 }
 
-// ─── Webhook ─────────────────────────────────────────────────────────────
-
-// SetWebhook configura o webhook global de uma instância.
-// Aponta TODOS os eventos para uma URL. events: lista de eventos a entregar.
-func (c *Client) SetWebhook(ctx context.Context, instance, url string, events []string, base64 bool) error {
-	payload := WebhookSetRequest{
-		URL:             url,
-		WebhookByEvents: false,
-		WebhookBase64:   base64,
-		Events:          events,
-	}
-	path := fmt.Sprintf("/webhook/set/%s", instance)
-	return c.do(ctx, http.MethodPost, path, payload, nil)
-}
-
-// ─── Instance lifecycle ──────────────────────────────────────────────────
-
-// Connect inicia pareamento (gera QR se necessário).
-func (c *Client) Connect(ctx context.Context, instance string) (*ConnectResponse, error) {
+// Connect configura a conexão e as assinaturas de eventos da instância.
+func (c *Client) Connect(ctx context.Context, req ConnectRequest) (*ConnectResponse, error) {
 	var out ConnectResponse
-	path := fmt.Sprintf("/instance/connect/%s", instance)
-	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/instance/connect", req, &out); err != nil {
 		return nil, fmt.Errorf("evogo: connect: %w", err)
 	}
 	return &out, nil
 }
 
-// GetStatus busca o status da instância.
-func (c *Client) GetStatus(ctx context.Context, instance string) (*InstanceStatus, error) {
+// GetStatus busca o status da instância associada ao token.
+func (c *Client) GetStatus(ctx context.Context) (*InstanceStatus, error) {
 	var out InstanceStatus
-	path := fmt.Sprintf("/instance/status/%s", instance)
-	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/instance/status", nil, &out); err != nil {
 		return nil, fmt.Errorf("evogo: status: %w", err)
 	}
 	return &out, nil
 }
 
-// CreateInstance cria uma nova instância (caso ainda não exista).
-func (c *Client) CreateInstance(ctx context.Context, instanceName, number string) error {
-	payload := map[string]any{
-		"instanceName": instanceName,
-		"number":       number,
-		"integration":  "WHATSAPP-BAILEYS",
-	}
-	return c.do(ctx, http.MethodPost, "/instance/create", payload, nil)
-}
-
-// ─── HTTP transport ──────────────────────────────────────────────────────
-
-func (c *Client) do(ctx context.Context, method, path string, body any, out any) error {
+func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
 	var bodyReader io.Reader
 	if body != nil {
 		buf, err := json.Marshal(body)
 		if err != nil {
-			return fmt.Errorf("evogo: marshal: %w", err)
+			return fmt.Errorf("evogo: marshal request: %w", err)
 		}
 		bodyReader = bytes.NewReader(buf)
 	}
+
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
 	if err != nil {
-		return fmt.Errorf("evogo: new request: %w", err)
+		return fmt.Errorf("evogo: create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("apikey", c.apiKey)
+	req.Header.Set("apikey", c.token)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("evogo: do: %w", err)
+		return &TransportError{Err: err}
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("evogo: %s %s → %d: %s", method, path, resp.StatusCode, string(respBody))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
+	if err != nil {
+		return fmt.Errorf("evogo: read response: %w", err)
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return &HTTPError{Method: method, Path: path, StatusCode: resp.StatusCode}
 	}
 	if out != nil && len(respBody) > 0 {
 		if err := json.Unmarshal(respBody, out); err != nil {
-			return fmt.Errorf("evogo: unmarshal: %w (body: %s)", err, string(respBody))
+			return fmt.Errorf("evogo: decode response: %w", err)
 		}
 	}
 	return nil

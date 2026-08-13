@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
@@ -32,7 +33,8 @@ import (
 func chatwootWebhookHandler(d Deps) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Lê body cru pra HMAC
-		rawBody, err := io.ReadAll(io.LimitReader(c.Request.Body, 5*1024*1024)) // 5MB max
+		bodyReader := http.MaxBytesReader(c.Writer, c.Request.Body, 5*1024*1024)
+		rawBody, err := io.ReadAll(bodyReader)
 		if err != nil {
 			respondErr(c, http.StatusBadRequest, "read_body", err)
 			return
@@ -60,6 +62,7 @@ func chatwootWebhookHandler(d Deps) gin.HandlerFunc {
 			respondErr(c, http.StatusBadRequest, "missing_inbox", errors.New("inbox_id not found in payload"))
 			return
 		}
+		env.Conversation.InboxID = inboxID
 
 		// Resolve tenant
 		tenant, err := d.Store.GetTenantByChatwootInbox(c.Request.Context(), inboxID)
@@ -68,26 +71,35 @@ func chatwootWebhookHandler(d Deps) gin.HandlerFunc {
 			return
 		}
 
-		// Valida HMAC se tenant tiver token configurado
+		// Todo tenant ativo precisa ter o secret da API inbox persistido.
+		if tenant.ChatwootHMAC == "" {
+			metrics.BridgeErrors.WithLabelValues("hmac_not_configured", "http").Inc()
+			respondErr(c, http.StatusServiceUnavailable, "signature_not_configured", errors.New("tenant has no webhook secret"))
+			return
+		}
+
 		signature := c.GetHeader("X-Chatwoot-Signature")
-		if tenant.ChatwootHMAC != "" {
-			if !chatwoot.VerifySignature(signature, tenant.ChatwootHMAC, string(rawBody), "plain") {
-				metrics.BridgeErrors.WithLabelValues("hmac_invalid", "http").Inc()
-				respondErr(c, http.StatusUnauthorized, "invalid_signature", errors.New("HMAC invalid"))
-				return
-			}
+		timestamp := c.GetHeader("X-Chatwoot-Timestamp")
+		if !chatwoot.VerifySignature(signature, timestamp, tenant.ChatwootHMAC, rawBody, time.Now(), d.ReplayWindow) {
+			metrics.BridgeErrors.WithLabelValues("hmac_invalid", "http").Inc()
+			respondErr(c, http.StatusUnauthorized, "invalid_signature", errors.New("webhook signature rejected"))
+			return
 		}
 
 		// Processa via core
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 25*time.Second)
 		defer cancel()
-		err = d.Bridge.HandleChatwootWebhook(ctx, env, signature, tenant.ChatwootHMAC, "plain", rawBody)
+		err = d.Bridge.HandleChatwootWebhook(ctx, env)
 		if err != nil {
 			switch {
 			case errors.Is(err, bridge.ErrPaused):
 				respondErr(c, http.StatusServiceUnavailable, "paused", err)
 			case errors.Is(err, bridge.ErrSkipped):
-				c.JSON(http.StatusOK, gin.H{"status": "skipped", "reason": err.Error()})
+				c.JSON(http.StatusOK, gin.H{"status": "skipped"})
+			case errors.Is(err, bridge.ErrRateLimited):
+				respondErr(c, http.StatusTooManyRequests, "rate_limited", err)
+			case errors.Is(err, bridge.ErrInProgress):
+				respondErr(c, http.StatusServiceUnavailable, "in_progress", err)
 			default:
 				respondErr(c, http.StatusInternalServerError, "bridge_error", err)
 			}
@@ -99,5 +111,6 @@ func chatwootWebhookHandler(d Deps) gin.HandlerFunc {
 
 func respondErr(c *gin.Context, code int, label string, err error) {
 	metrics.HTTPRequests.WithLabelValues(c.Request.Method, c.FullPath(), strconv.Itoa(code)).Inc()
-	c.JSON(code, gin.H{"error": label, "detail": err.Error()})
+	slog.Warn("http request rejected", "label", label, "err", err)
+	c.JSON(code, gin.H{"error": label})
 }

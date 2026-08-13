@@ -4,13 +4,41 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 )
 
-// Client é o cliente HTTP do Chatwoot (server-side, não client-facing).
+const maxResponseBody = 1 << 20
+
+// ErrNotFound é retornado quando o recurso não existe.
+var ErrNotFound = errors.New("chatwoot: not found")
+
+// HTTPError representa uma resposta não-2xx sem expor o corpo do upstream.
+type HTTPError struct {
+	Method     string
+	Path       string
+	StatusCode int
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("chatwoot: %s %s returned status %d", e.Method, e.Path, e.StatusCode)
+}
+
+// TransportError preserva a causa para errors.Is/As, mas evita que a URL
+// (que pode conter um identifier/JID na query) apareça em logs.
+type TransportError struct {
+	Err error
+}
+
+func (e *TransportError) Error() string { return "chatwoot: upstream transport failed" }
+func (e *TransportError) Unwrap() error { return e.Err }
+
+// Client é o cliente HTTP administrativo do Chatwoot.
 type Client struct {
 	baseURL    string
 	accountID  int
@@ -18,22 +46,22 @@ type Client struct {
 	httpClient *http.Client
 }
 
-// NewClient cria um client. token = api_access_token (Profile → Access Token
-// ou Platform App).
+// NewClient cria um client autenticado por api_access_token.
 func NewClient(baseURL string, accountID int, token string) *Client {
 	return &Client{
-		baseURL:   baseURL,
+		baseURL:   strings.TrimRight(baseURL, "/"),
 		accountID: accountID,
 		token:     token,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
 	}
 }
 
-// ─── Inboxes ─────────────────────────────────────────────────────────────
-
-// CreateAPIInbox cria uma inbox API Channel apontando pro nosso webhook.
+// CreateAPIInbox cria uma inbox API Channel apontando para o conector.
 func (c *Client) CreateAPIInbox(ctx context.Context, name, webhookURL string) (*InboxResponse, error) {
 	payload := InboxCreatePayload{
 		Name:                 name,
@@ -46,7 +74,8 @@ func (c *Client) CreateAPIInbox(ctx context.Context, name, webhookURL string) (*
 		},
 	}
 	var out InboxResponse
-	if err := c.do(ctx, http.MethodPost, fmt.Sprintf("/api/v1/accounts/%d/inboxes", c.accountID), payload, &out); err != nil {
+	path := fmt.Sprintf("/api/v1/accounts/%d/inboxes", c.accountID)
+	if err := c.do(ctx, http.MethodPost, path, payload, &out); err != nil {
 		return nil, fmt.Errorf("chatwoot: create inbox: %w", err)
 	}
 	return &out, nil
@@ -55,78 +84,93 @@ func (c *Client) CreateAPIInbox(ctx context.Context, name, webhookURL string) (*
 // GetInbox busca dados de uma inbox.
 func (c *Client) GetInbox(ctx context.Context, inboxID int) (*InboxResponse, error) {
 	var out InboxResponse
-	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/api/v1/accounts/%d/inboxes/%d", c.accountID, inboxID), nil, &out); err != nil {
+	path := fmt.Sprintf("/api/v1/accounts/%d/inboxes/%d", c.accountID, inboxID)
+	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
 		return nil, fmt.Errorf("chatwoot: get inbox: %w", err)
 	}
 	return &out, nil
 }
 
-// ─── Contacts ────────────────────────────────────────────────────────────
-
-// CreateContact cria um contato numa inbox específica, com source_id = JID.
-// O Chatwoot deduz automaticamente o contact_inbox; source_id é a chave
-// estável que sobrevive a renomeação do contato.
-func (c *Client) CreateContact(ctx context.Context, inboxID int, name, sourceID string) (*ContactResponse, error) {
-	payload := ContactCreatePayload{
-		Name:     name,
-		InboxID:  inboxID,
-		SourceID: sourceID,
-	}
-	var out ContactResponse
-	if err := c.do(ctx, http.MethodPost, fmt.Sprintf("/api/v1/accounts/%d/contacts", c.accountID), payload, &out); err != nil {
+// CreateContact cria um contato identificado de forma estável pelo JID.
+// O vínculo com a inbox é criado separadamente por EnsureContactInbox.
+func (c *Client) CreateContact(ctx context.Context, name, identifier string) (*ContactResponse, error) {
+	payload := ContactCreatePayload{Name: name, Identifier: identifier}
+	var out ContactCreateResponse
+	path := fmt.Sprintf("/api/v1/accounts/%d/contacts", c.accountID)
+	if err := c.do(ctx, http.MethodPost, path, payload, &out); err != nil {
 		return nil, fmt.Errorf("chatwoot: create contact: %w", err)
 	}
-	return &out, nil
+	if out.Payload.Contact.ID == 0 {
+		return nil, errors.New("chatwoot: create contact returned no contact")
+	}
+	return &out.Payload.Contact, nil
 }
 
-// FindContactBySourceID busca um contato pelo source_id (JID) numa inbox.
-// Retorna ErrNotFound se não existe.
-func (c *Client) FindContactBySourceID(ctx context.Context, inboxID int, sourceID string) (*ContactResponse, error) {
-	var out struct {
-		Payload []ContactResponse `json:"payload"`
-	}
-	path := fmt.Sprintf("/api/v1/accounts/%d/contacts/search?q=%s", c.accountID, sourceID)
+// FindContactByIdentifier busca um contato pelo identifier e valida a
+// correspondência exata para não aceitar resultados parciais da busca.
+func (c *Client) FindContactByIdentifier(ctx context.Context, identifier string) (*ContactResponse, error) {
+	var out ContactListResponse
+	query := url.Values{"q": []string{identifier}}.Encode()
+	path := fmt.Sprintf("/api/v1/accounts/%d/contacts/search?%s", c.accountID, query)
 	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
 		return nil, fmt.Errorf("chatwoot: search contact: %w", err)
 	}
-	for _, ct := range out.Payload {
-		if ct.SourceID == sourceID {
-			return &ct, nil
+	for i := range out.Payload {
+		if out.Payload[i].Identifier == identifier {
+			return &out.Payload[i], nil
 		}
 	}
 	return nil, ErrNotFound
 }
 
-// ErrNotFound é retornado quando o recurso não existe.
-var ErrNotFound = fmt.Errorf("chatwoot: not found")
+// EnsureContactInbox garante que o contato está vinculado à inbox e que o
+// contact_inbox.source_id é exatamente o JID informado.
+func (c *Client) EnsureContactInbox(ctx context.Context, contact *ContactResponse, inboxID int, sourceID string) (*ContactInboxResponse, error) {
+	for i := range contact.ContactInboxes {
+		ci := &contact.ContactInboxes[i]
+		if ci.Inbox.ID == inboxID && ci.SourceID == sourceID {
+			return ci, nil
+		}
+	}
 
-// ─── Conversations ───────────────────────────────────────────────────────
+	payload := ContactInboxCreatePayload{InboxID: inboxID, SourceID: sourceID}
+	var out ContactInboxResponse
+	path := fmt.Sprintf("/api/v1/accounts/%d/contacts/%d/contact_inboxes", c.accountID, contact.ID)
+	if err := c.do(ctx, http.MethodPost, path, payload, &out); err != nil {
+		createErr := err
+		if contact.Identifier != "" {
+			refreshed, findErr := c.FindContactByIdentifier(ctx, contact.Identifier)
+			if findErr == nil {
+				for i := range refreshed.ContactInboxes {
+					ci := &refreshed.ContactInboxes[i]
+					if ci.Inbox.ID == inboxID && ci.SourceID == sourceID {
+						return ci, nil
+					}
+				}
+			}
+		}
+		return nil, fmt.Errorf("chatwoot: create contact inbox: %w", createErr)
+	}
+	if out.SourceID != sourceID || out.Inbox.ID != inboxID {
+		return nil, errors.New("chatwoot: contact inbox returned unexpected binding")
+	}
+	return &out, nil
+}
 
 // CreateConversation cria uma conversa para um contato.
 func (c *Client) CreateConversation(ctx context.Context, sourceID string, contactID, inboxID int) (*ConversationResponse, error) {
-	payload := ConversationCreatePayload{
-		SourceID:  sourceID,
-		ContactID: contactID,
-		InboxID:   inboxID,
-		Status:    "open",
-	}
+	payload := ConversationCreatePayload{SourceID: sourceID, ContactID: contactID, InboxID: inboxID, Status: "open"}
 	var out ConversationResponse
-	if err := c.do(ctx, http.MethodPost, fmt.Sprintf("/api/v1/accounts/%d/conversations", c.accountID), payload, &out); err != nil {
+	path := fmt.Sprintf("/api/v1/accounts/%d/conversations", c.accountID)
+	if err := c.do(ctx, http.MethodPost, path, payload, &out); err != nil {
 		return nil, fmt.Errorf("chatwoot: create conversation: %w", err)
 	}
 	return &out, nil
 }
 
-// ─── Messages ────────────────────────────────────────────────────────────
-
-// CreateIncomingMessage posta uma mensagem incoming (do cliente) na conversa.
-func (c *Client) CreateIncomingMessage(ctx context.Context, conversationID int64, content string, contentType string) error {
-	payload := MessageCreatePayload{
-		Content:     content,
-		MessageType: "incoming",
-		Private:     false,
-		ContentType: contentType,
-	}
+// CreateIncomingMessage posta uma mensagem incoming na conversa.
+func (c *Client) CreateIncomingMessage(ctx context.Context, conversationID int64, content, contentType string) error {
+	payload := MessageCreatePayload{Content: content, MessageType: "incoming", Private: false, ContentType: contentType}
 	path := fmt.Sprintf("/api/v1/accounts/%d/conversations/%d/messages", c.accountID, conversationID)
 	if err := c.do(ctx, http.MethodPost, path, payload, nil); err != nil {
 		return fmt.Errorf("chatwoot: create incoming message: %w", err)
@@ -134,20 +178,19 @@ func (c *Client) CreateIncomingMessage(ctx context.Context, conversationID int64
 	return nil
 }
 
-// ─── HTTP transport ──────────────────────────────────────────────────────
-
-func (c *Client) do(ctx context.Context, method, path string, body any, out any) error {
+func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
 	var bodyReader io.Reader
 	if body != nil {
 		buf, err := json.Marshal(body)
 		if err != nil {
-			return fmt.Errorf("chatwoot: marshal: %w", err)
+			return fmt.Errorf("chatwoot: marshal request: %w", err)
 		}
 		bodyReader = bytes.NewReader(buf)
 	}
+
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
 	if err != nil {
-		return fmt.Errorf("chatwoot: new request: %w", err)
+		return fmt.Errorf("chatwoot: create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -155,21 +198,23 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("chatwoot: do: %w", err)
+		return &TransportError{Err: err}
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
-
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
+	if err != nil {
+		return fmt.Errorf("chatwoot: read response: %w", err)
+	}
 	if resp.StatusCode == http.StatusNotFound {
 		return ErrNotFound
 	}
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("chatwoot: %s %s → %d: %s", method, path, resp.StatusCode, string(respBody))
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return &HTTPError{Method: method, Path: req.URL.Path, StatusCode: resp.StatusCode}
 	}
 	if out != nil && len(respBody) > 0 {
 		if err := json.Unmarshal(respBody, out); err != nil {
-			return fmt.Errorf("chatwoot: unmarshal: %w (body: %s)", err, string(respBody))
+			return fmt.Errorf("chatwoot: decode response: %w", err)
 		}
 	}
 	return nil

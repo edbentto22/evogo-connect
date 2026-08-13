@@ -25,10 +25,19 @@ import (
 
 // Deps agrupa as dependências dos handlers.
 type Deps struct {
-	Store        *store.Store
+	Store        HTTPStore
 	Bridge       *bridge.Core
 	AdminToken   string
 	ReplayWindow time.Duration
+}
+
+// HTTPStore contém as operações persistentes usadas pela camada HTTP.
+type HTTPStore interface {
+	Ping(context.Context) error
+	GetTenantByChatwootInbox(context.Context, int) (*store.Tenant, error)
+	SetPaused(context.Context, bool, string) error
+	IsPaused(context.Context) (bool, error)
+	ListTenants(context.Context) ([]store.Tenant, error)
 }
 
 // NewRouter monta o router Gin.
@@ -43,8 +52,9 @@ func NewRouter(d Deps) *gin.Engine {
 	r.GET("/readyz", func(c *gin.Context) {
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
 		defer cancel()
-		if err := d.Store.Pool().Ping(ctx); err != nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "db_down", "error": err.Error()})
+		if err := d.Store.Ping(ctx); err != nil {
+			slog.Warn("readiness check failed", "err", err)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "db_down"})
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "ready"})

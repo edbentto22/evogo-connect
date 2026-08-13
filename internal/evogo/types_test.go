@@ -3,46 +3,53 @@ package evogo
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestSendTextRequestJSON(t *testing.T) {
-	r := SendTextRequest{Number: "5511999999999", Text: "oi"}
-	b, err := json.Marshal(r)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	// delay=0 é omitido por `omitempty`
-	want := `{"number":"5511999999999","text":"oi"}`
-	if string(b) != want {
-		t.Errorf("got %s, want %s", string(b), want)
-	}
+	b, err := json.Marshal(SendTextRequest{Number: "5511999999999", Text: "oi"})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"number":"5511999999999","text":"oi"}`, string(b))
 }
 
-func TestWebhookSetRequestJSON(t *testing.T) {
-	r := WebhookSetRequest{
-		URL:    "https://example.com/wh",
-		Events: []string{"MESSAGES_UPSERT", "CONNECTION_UPDATE"},
-	}
-	b, err := json.Marshal(r)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	got := string(b)
-	if got != `{"url":"https://example.com/wh","webhook_by_events":false,"webhook_base64":false,"events":["MESSAGES_UPSERT","CONNECTION_UPDATE"]}` {
-		t.Errorf("got %s", got)
-	}
+func TestSendMediaRequestJSON(t *testing.T) {
+	b, err := json.Marshal(SendMediaRequest{
+		Number:   "5511999999999",
+		URL:      "https://example.com/doc.pdf",
+		Type:     "document",
+		Filename: "doc.pdf",
+		Caption:  "arquivo",
+	})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{
+		"number":"5511999999999",
+		"url":"https://example.com/doc.pdf",
+		"type":"document",
+		"filename":"doc.pdf",
+		"caption":"arquivo"
+	}`, string(b))
+}
+
+func TestConnectRequestJSON(t *testing.T) {
+	b, err := json.Marshal(ConnectRequest{
+		WebhookURL: "https://connector.example.com/webhook/evo/demo",
+		Subscribe:  []string{"MESSAGE", "CONNECTION"},
+		Immediate:  true,
+	})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{
+		"webhookUrl":"https://connector.example.com/webhook/evo/demo",
+		"subscribe":["MESSAGE","CONNECTION"],
+		"immediate":true
+	}`, string(b))
 }
 
 func TestWebhookEnvelopeDecode(t *testing.T) {
 	raw := `{"event":"MESSAGES_UPSERT","instance":"demo","data":{"key":{"remoteJid":"5511@s.whatsapp.net","fromMe":false,"id":"ABC"},"messageType":"conversation","pushName":"João"}}`
 	var env WebhookEnvelope
-	if err := json.Unmarshal([]byte(raw), &env); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if env.Event != "MESSAGES_UPSERT" {
-		t.Errorf("event=%q", env.Event)
-	}
-	if env.Instance != "demo" {
-		t.Errorf("instance=%q", env.Instance)
-	}
+	require.NoError(t, json.Unmarshal([]byte(raw), &env))
+	assert.Equal(t, "MESSAGES_UPSERT", env.Event)
+	assert.Equal(t, "demo", env.Instance)
 }

@@ -2,10 +2,6 @@
 // webhook payload da API Channel inbox.
 package chatwoot
 
-import (
-	"time"
-)
-
 // ─── Webhook payload (Chatwoot API Channel) ──────────────────────────────
 
 // WebhookEnvelope é o payload que o Chatwoot POSTa no webhook_url da inbox.
@@ -33,7 +29,7 @@ type ConversationRef struct {
 	AccountID    int          `json:"account_id"`
 	InboxID      int          `json:"inbox_id"`
 	Status       string       `json:"status"`
-	CreatedAt    time.Time    `json:"created_at"`
+	CreatedAt    int64        `json:"created_at"`
 }
 
 // ContactInbox referencia a session do contato na inbox.
@@ -53,11 +49,13 @@ type SenderRef struct {
 
 // Attachment é um anexo da mensagem.
 type Attachment struct {
-	ID       int64  `json:"id"`
-	FileType string `json:"file_type"` // "image" | "audio" | "video" | "file"
-	FileURL  string `json:"file_url"`
-	FileName string `json:"file_name"`
-	MimeType string `json:"file_type_content_type,omitempty"`
+	ID          int64  `json:"id"`
+	FileType    string `json:"file_type"` // "image" | "audio" | "video" | "file"
+	DataURL     string `json:"data_url"`
+	ThumbURL    string `json:"thumb_url,omitempty"`
+	ContentType string `json:"content_type,omitempty"`
+	Extension   string `json:"extension,omitempty"`
+	FileSize    int64  `json:"file_size,omitempty"`
 }
 
 // ─── Create inbox (POST /api/v1/accounts/{account_id}/inboxes) ────────────
@@ -80,16 +78,15 @@ type InboxChannel struct {
 
 // InboxResponse é a resposta de criar inbox.
 type InboxResponse struct {
-	ID        int    `json:"id"`
-	Name      string `json:"name"`
-	ChannelID int    `json:"channel_id"`
-	AccountID int    `json:"account_id"`
-	Channel   struct {
-		ID         int    `json:"id"`
-		WebWidget  string `json:"web_widget"`
-		HMACToken  string `json:"hmac_token,omitempty"`
-		WebhookURL string `json:"webhook_url"`
-	} `json:"channel"`
+	ID              int    `json:"id"`
+	Name            string `json:"name"`
+	ChannelID       int    `json:"channel_id"`
+	ChannelType     string `json:"channel_type"`
+	AccountID       int    `json:"account_id"`
+	HMACToken       string `json:"hmac_token,omitempty"`
+	Secret          string `json:"secret,omitempty"`
+	WebhookURL      string `json:"webhook_url"`
+	InboxIdentifier string `json:"inbox_identifier"`
 }
 
 // ─── Create contact (POST /api/v1/accounts/{account_id}/contacts) ────────
@@ -97,17 +94,45 @@ type InboxResponse struct {
 // ContactCreatePayload é o body para criar contato.
 type ContactCreatePayload struct {
 	Name             string         `json:"name"`
-	InboxID          int            `json:"inbox_id"`
-	SourceID         string         `json:"source_id"` // JID do WhatsApp
+	Identifier       string         `json:"identifier"`
 	CustomAttributes map[string]any `json:"custom_attributes,omitempty"`
 }
 
 // ContactResponse é a resposta de criar contato.
 type ContactResponse struct {
+	ID             int                    `json:"id"`
+	Name           string                 `json:"name"`
+	Identifier     string                 `json:"identifier"`
+	ContactInboxes []ContactInboxResponse `json:"contact_inboxes"`
+}
+
+// ContactListResponse é o envelope retornado pelos endpoints de contatos.
+type ContactListResponse struct {
+	Payload []ContactResponse `json:"payload"`
+	ID      int               `json:"id,omitempty"`
+}
+
+// ContactCreateResponse é o envelope retornado ao criar um contato.
+type ContactCreateResponse struct {
+	Payload struct {
+		Contact      ContactResponse       `json:"contact"`
+		ContactInbox *ContactInboxResponse `json:"contact_inbox,omitempty"`
+	} `json:"payload"`
+}
+
+// ContactInboxResponse representa o vínculo entre contato e inbox.
+type ContactInboxResponse struct {
 	ID       int    `json:"id"`
-	Name     string `json:"name"`
 	SourceID string `json:"source_id"`
+	Inbox    struct {
+		ID int `json:"id"`
+	} `json:"inbox"`
+}
+
+// ContactInboxCreatePayload cria o source_id estável do canal API.
+type ContactInboxCreatePayload struct {
 	InboxID  int    `json:"inbox_id"`
+	SourceID string `json:"source_id"`
 }
 
 // ─── Create conversation (POST /api/v1/accounts/{account_id}/conversations) ───

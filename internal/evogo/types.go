@@ -1,16 +1,14 @@
-// Package evogo implementa o cliente HTTP do evolution-go (REST API e webhook events).
+// Package evogo implementa o cliente HTTP do Evolution Go.
 package evogo
 
-// ─── Webhook payload ─────────────────────────────────────────────────────
-
-// WebhookEnvelope é o payload base de qualquer evento evolution-go.
+// WebhookEnvelope é o payload base de eventos do Evolution Go.
 type WebhookEnvelope struct {
-	Event    string `json:"event"` // "MESSAGES_UPSERT", "MESSAGES_UPDATE", etc.
+	Event    string `json:"event"`
 	Instance string `json:"instance"`
 	Data     any    `json:"data"`
 }
 
-// MessagesUpsertData é o data de MESSAGES_UPSERT.
+// MessagesUpsertData representa dados de uma mensagem recebida.
 type MessagesUpsertData struct {
 	Key struct {
 		RemoteJID string `json:"remoteJid"`
@@ -23,82 +21,72 @@ type MessagesUpsertData struct {
 	MessageTimestamp int64          `json:"messageTimestamp"`
 }
 
-// ConnectionUpdateData é o data de CONNECTION_UPDATE.
+// ConnectionUpdateData representa uma mudança de estado da conexão.
 type ConnectionUpdateData struct {
-	State    string `json:"state"` // "open" | "close" | "connecting"
+	State    string `json:"state"`
 	Instance string `json:"instance"`
 }
 
-// ─── Send text (POST /message/sendText/{instance}) ───────────────────────
-
-// SendTextRequest é o body de sendText.
+// SendTextRequest é o body de POST /send/text.
 type SendTextRequest struct {
 	Number string `json:"number"`
 	Text   string `json:"text"`
-	Delay  int    `json:"delay,omitempty"` // ms
+	ID     string `json:"id,omitempty"`
+	Delay  int    `json:"delay,omitempty"`
 }
 
-// SendTextResponse é a resposta genérica (depende da versão).
+// SendTextResponse é a resposta de envio de mensagem.
 type SendTextResponse struct {
-	Key struct {
-		RemoteJID string `json:"remoteJid"`
-		FromMe    bool   `json:"fromMe"`
-		ID        string `json:"id"`
-	} `json:"key"`
-	Message          any    `json:"message"`
-	MessageTimestamp int64  `json:"messageTimestamp"`
-	Status           string `json:"status"`
+	Message string `json:"message"`
+	Data    struct {
+		Info struct {
+			ID        string `json:"ID"`
+			ServerID  int64  `json:"ServerID"`
+			Timestamp string `json:"Timestamp"`
+			Type      string `json:"Type"`
+		} `json:"Info"`
+	} `json:"data"`
 }
 
-// ─── Send media (POST /message/sendMedia/{instance}) ─────────────────────
-
-// SendMediaRequest é o body de sendMedia.
-// Media pode ser URL (http) ou base64.
+// SendMediaRequest é o body de POST /send/media.
 type SendMediaRequest struct {
-	Number    string `json:"number"`
-	MediaType string `json:"mediatype"` // "image" | "audio" | "video" | "document" | "sticker"
-	Media     string `json:"media"`     // URL ou base64
-	FileName  string `json:"fileName,omitempty"`
-	Caption   string `json:"caption,omitempty"`
-	MimeType  string `json:"mimetype,omitempty"`
-	Delay     int    `json:"delay,omitempty"`
+	Number   string `json:"number"`
+	URL      string `json:"url"`
+	Type     string `json:"type"`
+	Caption  string `json:"caption,omitempty"`
+	Filename string `json:"filename,omitempty"`
+	ID       string `json:"id,omitempty"`
+	Delay    int    `json:"delay,omitempty"`
 }
 
-// ─── Webhook set (POST /webhook/set/{instance}) ──────────────────────────
-
-// WebhookSetRequest configura o webhook global da instância.
-type WebhookSetRequest struct {
-	URL             string   `json:"url"`
-	WebhookByEvents bool     `json:"webhook_by_events"`
-	WebhookBase64   bool     `json:"webhook_base64"`
-	Events          []string `json:"events"`
-}
-
-// ─── Connect (POST /instance/connect) ────────────────────────────────────
-
-// ConnectRequest inicia a conexão (e pareamento QR) da instância.
+// ConnectRequest é o body de POST /instance/connect.
 type ConnectRequest struct {
-	Number string `json:"number,omitempty"` // pode ser vazio
+	WebhookURL      string   `json:"webhookUrl,omitempty"`
+	Subscribe       []string `json:"subscribe,omitempty"`
+	Immediate       bool     `json:"immediate,omitempty"`
+	Phone           string   `json:"phone,omitempty"`
+	RabbitMQEnable  string   `json:"rabbitmqEnable,omitempty"`
+	WebsocketEnable string   `json:"websocketEnable,omitempty"`
+	NATSEnable      string   `json:"natsEnable,omitempty"`
 }
 
-// ConnectResponse inclui o QR code (base64) e status.
+// ConnectResponse descreve o resultado do pareamento/conexão.
 type ConnectResponse struct {
-	Code         string `json:"code,omitempty"`
-	Base64       string `json:"base64,omitempty"`
-	Count        int    `json:"count,omitempty"`
-	InstanceName string `json:"instanceName"`
-	State        string `json:"state,omitempty"` // "open" | "close" | "connecting"
+	Message string `json:"message"`
+	Data    struct {
+		JID         string `json:"jid"`
+		WebhookURL  string `json:"webhookUrl"`
+		EventString string `json:"eventString"`
+	} `json:"data"`
 }
 
-// ─── Instance status (GET /instance/status/{instance}) ───────────────────
-
-// InstanceStatus é a resposta de status.
+// InstanceStatus descreve o estado da instância associada ao token.
 type InstanceStatus struct {
-	Instance struct {
+	Message string `json:"message"`
+	Data    struct {
+		Connected bool   `json:"connected"`
+		LoggedIn  bool   `json:"loggedIn"`
 		Name      string `json:"name"`
-		State     string `json:"state"`
-		ServerURL string `json:"serverUrl"`
-		APKey     string `json:"apikey"` // echo
-		OwnerJID  string `json:"ownerJid,omitempty"`
-	} `json:"instance"`
+		MyJID     string `json:"myJid"`
+	} `json:"data"`
 }
