@@ -200,15 +200,21 @@ func newWebhookSecret() (string, error) {
 
 func configureEvogoWebhook(ctx context.Context, evo *evogo.Client, connectURL, instance, secret string) error {
 	webhookURL := strings.TrimRight(connectURL, "/") + "/webhook/evo/" + instance + "/" + secret
-	response, err := evo.Connect(ctx, evogo.ConnectRequest{WebhookURL: webhookURL, Subscribe: []string{"MESSAGES_UPSERT"}, Immediate: true})
+	// Evolution Go 0.7.2 configura categorias em maiúsculas (MESSAGE), mas
+	// alguns builds anteriores retornam o nome técnico MESSAGES_UPSERT no
+	// eventString. O receptor aceita os dois formatos equivalentes.
+	response, err := evo.Connect(ctx, evogo.ConnectRequest{WebhookURL: webhookURL, Subscribe: []string{"MESSAGE"}, Immediate: true})
 	if err != nil {
 		return fmt.Errorf("configure Evolution Go webhook: %w", err)
 	}
 	if response.Data.WebhookURL == "" || response.Data.WebhookURL != webhookURL {
 		return errors.New("Evolution Go returned a different webhook URL")
 	}
-	if !hasMessagesUpsert(response.Data.EventString) {
-		return errors.New("Evolution Go did not confirm MESSAGES_UPSERT subscription")
+	if response.Message != "success" {
+		return errors.New("Evolution Go did not confirm webhook configuration")
+	}
+	if !hasMessageSubscription(response.Data.EventString) {
+		return errors.New("Evolution Go did not confirm MESSAGE subscription")
 	}
 	fmt.Println("✓ Webhook Evolution Go configurado para mensagens recebidas")
 	return nil
@@ -218,15 +224,22 @@ func validEvoInstanceName(name string) bool {
 	return evoInstanceNamePattern.MatchString(name)
 }
 
-func hasMessagesUpsert(eventString string) bool {
+func hasMessageSubscription(eventString string) bool {
 	for _, item := range strings.FieldsFunc(strings.ToUpper(eventString), func(r rune) bool {
-		return r < 'A' || r > 'Z'
+		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n'
 	}) {
-		if item == "MESSAGES" { // "MESSAGES_UPSERT" is split at underscore.
-			return strings.Contains(strings.ToUpper(eventString), "MESSAGES_UPSERT")
+		var normalized strings.Builder
+		for _, r := range item {
+			if r >= 'A' && r <= 'Z' {
+				normalized.WriteRune(r)
+			}
+		}
+		switch normalized.String() {
+		case "MESSAGESUPSERT", "MESSAGE":
+			return true
 		}
 	}
-	return strings.Contains(strings.ToUpper(eventString), "MESSAGES_UPSERT")
+	return false
 }
 
 // setupCredential prioriza a flag para compatibilidade e usa env como caminho

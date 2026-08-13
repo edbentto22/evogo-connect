@@ -92,7 +92,7 @@ processamento retornam erro reenviável, não um falso 200.
 
 ## Fluxo: cliente manda texto WhatsApp → agente recebe no Chatwoot
 
-1. Evolution Go envia `MESSAGES_UPSERT` para a URL exclusiva da instância.
+1. Evolution Go envia o evento de mensagem (`MESSAGE` ou `MESSAGES_UPSERT`) para a URL exclusiva da instância.
 2. O conector valida o segredo no caminho em tempo constante e limita o body.
 3. Aceita apenas texto direto recebido (`fromMe=false`); grupos, mídia e
    eventos desconhecidos retornam 200 sem efeito.

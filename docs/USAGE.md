@@ -121,7 +121,8 @@ O que aconteceu:
 4. **Tenant e segredo do webhook** são persistidos no Postgres (cifrados com
    `CONNECT_MASTER_KEY`).
 5. A Evolution Go recebe uma URL exclusiva por instância, com o segredo no
-   caminho e assinatura apenas de `MESSAGES_UPSERT`. Não copie a URL para logs,
+   caminho e assinatura apenas da categoria `MESSAGE` (o evento recebido pode
+   ser chamado de `MESSAGE` ou `MESSAGES_UPSERT`). Não copie a URL para logs,
    tickets ou chats.
 
 ---
