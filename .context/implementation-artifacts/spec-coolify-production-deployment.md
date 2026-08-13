@@ -66,7 +66,7 @@ context:
 
 ## Design Notes
 
-O pacote exige no mínimo Coolify `v4.0.0-beta.411`, versão em que magic variables também são suportadas para compose vindo de Git; cada versão instalada ainda precisa passar pela validação. `SERVICE_PASSWORD_64_POSTGRES` evita caracteres problemáticos no DSN, `SERVICE_REALBASE64_32_CONNECTOR` fornece a chave AES-256 e `SERVICE_HEX_64_CONNECTOR_ADMIN` fornece o token administrativo; esses valores persistem entre deployments e podem ser guardados para disaster recovery. O domínio usa `https://host:9090`: a porta seleciona o destino dentro do container, enquanto o proxy do Coolify publica HTTPS normalmente.
+O pacote exige no mínimo Coolify `v4.0.0-beta.411`, versão em que magic variables também são suportadas para compose vindo de Git; cada versão instalada ainda precisa passar pela validação. `SERVICE_PASSWORD_64_POSTGRES` evita caracteres problemáticos no DSN, `SERVICE_REALBASE64_32_CONNECTOR` fornece a chave AES-256 e `SERVICE_HEX_64_ADMIN` fornece o token administrativo; esses valores persistem entre deployments e podem ser guardados para disaster recovery. O domínio usa `https://host:9090`: a porta seleciona o destino dentro do container, enquanto o proxy do Coolify publica HTTPS normalmente.
 
 O compose não declara redes customizadas: o Coolify cria a rede isolada do recurso e conecta seu proxy, evitando seleção intermitente de um IP inacessível. O runtime Alpine opera como usuário não-root, com filesystem read-only, capabilities removidas e `no-new-privileges`, preservando o terminal necessário para `/app/connect` sem abrir escrita no container.
 

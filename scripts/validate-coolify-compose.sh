@@ -16,16 +16,16 @@ test -f "$COMPOSE_FILE" || fail "arquivo ausente: deploy/docker-compose.coolify.
 test -r "$ROOT_DIR/deploy/Dockerfile" || fail "Dockerfile ausente ou ilegível"
 umask 077
 
-compose=(docker compose --project-directory "$ROOT_DIR" -f "$COMPOSE_FILE")
+compose=(docker compose --env-file /dev/null --project-directory "$ROOT_DIR" -f "$COMPOSE_FILE")
 
 required_magic_variables=(
   'SERVICE_PASSWORD_64_POSTGRES'
   'SERVICE_REALBASE64_32_CONNECTOR'
-  'SERVICE_HEX_64_CONNECTOR_ADMIN'
+  'SERVICE_HEX_64_ADMIN'
 )
 
 for variable in "${required_magic_variables[@]}"; do
-  grep -Fq "\${$variable}" "$COMPOSE_FILE" || fail "magic variable ausente: $variable"
+  grep -Fq "\${$variable:?" "$COMPOSE_FILE" || fail "magic variable não usa operador obrigatório :?: $variable"
 done
 
 # Valores locais descartáveis existem apenas para o parser do Compose. Eles
@@ -33,10 +33,18 @@ done
 # o arquivo renderizado. Em produção, o Coolify gera e preserva os valores.
 export SERVICE_PASSWORD_64_POSTGRES="compose-validation-password"
 export SERVICE_REALBASE64_32_CONNECTOR="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
-export SERVICE_HEX_64_CONNECTOR_ADMIN="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+export SERVICE_HEX_64_ADMIN="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 export CHATWOOT_TOKEN=""
 export EVO_INSTANCE_TOKEN=""
 export BRIDGE_PAUSED="true"
+
+# Cada segredo deve impedir a renderização quando ausente. Isso valida o
+# comportamento que evita containers reiniciando com configuração vazia.
+for variable in "${required_magic_variables[@]}"; do
+  if env -u "$variable" "${compose[@]}" config >/dev/null 2>&1; then
+    fail "compose aceita segredo obrigatório ausente: $variable"
+  fi
+done
 
 rendered_file="$(mktemp)"
 postgres_file="$(mktemp)"

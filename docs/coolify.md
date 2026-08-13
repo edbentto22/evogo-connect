@@ -32,7 +32,13 @@ O Coolify gera e preserva automaticamente:
 |---|---|
 | `SERVICE_PASSWORD_64_POSTGRES` | senha interna do PostgreSQL e DSN do conector |
 | `SERVICE_REALBASE64_32_CONNECTOR` | `CONNECT_MASTER_KEY`, chave AES-256 dos tokens persistidos |
-| `SERVICE_HEX_64_CONNECTOR_ADMIN` | `ADMIN_TOKEN` dos endpoints administrativos |
+| `SERVICE_HEX_64_ADMIN` | `ADMIN_TOKEN` dos endpoints administrativos |
+
+Se estiver atualizando um recurso que já possua um valor **não vazio** em
+`SERVICE_HEX_64_CONNECTOR_ADMIN`, copie esse mesmo valor para
+`SERVICE_HEX_64_ADMIN` antes do redeploy e remova a variável antiga somente
+depois de validar os endpoints administrativos. No primeiro deploy que falhou
+com `ADMIN_TOKEN not set`, não há token anterior válido a preservar.
 
 Não substitua nem regenere esses valores em redeploys. Guarde uma cópia segura
 dos três para disaster recovery. A `SERVICE_REALBASE64_32_CONNECTOR` é
