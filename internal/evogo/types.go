@@ -1,11 +1,17 @@
 // Package evogo implementa o cliente HTTP do Evolution Go.
 package evogo
 
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+)
+
 // WebhookEnvelope é o payload base de eventos do Evolution Go.
 type WebhookEnvelope struct {
-	Event    string `json:"event"`
-	Instance string `json:"instance"`
-	Data     any    `json:"data"`
+	Event    string          `json:"event"`
+	Instance string          `json:"instance"`
+	Data     json.RawMessage `json:"data"`
 }
 
 // MessagesUpsertData representa dados de uma mensagem recebida.
@@ -19,6 +25,49 @@ type MessagesUpsertData struct {
 	Message          map[string]any `json:"message"`
 	MessageType      string         `json:"messageType"`
 	MessageTimestamp int64          `json:"messageTimestamp"`
+}
+
+// IncomingText extrai somente o contrato seguro de mensagem direta em texto.
+// Evolution Go pode nomear o evento em maiúsculas ou minúsculas; o formato de
+// dados é o mesmo, conforme o contrato whatsmeow/Fazer.ai homologado.
+func (e WebhookEnvelope) IncomingText() (MessagesUpsertData, string, bool, error) {
+	var zero MessagesUpsertData
+	event := strings.ToUpper(strings.TrimSpace(e.Event))
+	if event != "MESSAGES_UPSERT" && event != "MESSAGE" {
+		return zero, "unsupported_event", false, nil
+	}
+	if len(e.Data) == 0 || string(e.Data) == "null" {
+		return zero, "invalid_payload", false, fmt.Errorf("evogo: webhook data is required")
+	}
+	var data MessagesUpsertData
+	if err := json.Unmarshal(e.Data, &data); err != nil {
+		return zero, "invalid_payload", false, fmt.Errorf("evogo: decode message data: %w", err)
+	}
+	jid := strings.ToLower(strings.TrimSpace(data.Key.RemoteJID))
+	if data.Key.FromMe || strings.HasSuffix(jid, "@g.us") || strings.HasSuffix(jid, "@broadcast") || strings.HasSuffix(jid, "@newsletter") {
+		return data, "unsupported_message", false, nil
+	}
+	content, messageIsText := incomingMessageText(data.Message)
+	messageType := strings.ToLower(strings.TrimSpace(data.MessageType))
+	if !messageIsText || strings.TrimSpace(content) == "" || (messageType != "conversation" && messageType != "extendedtextmessage") {
+		return data, "unsupported_message", false, nil
+	}
+	if strings.TrimSpace(data.Key.ID) == "" || strings.TrimSpace(data.Key.RemoteJID) == "" {
+		return zero, "invalid_payload", false, fmt.Errorf("evogo: message key is required")
+	}
+	return data, content, true, nil
+}
+
+func incomingMessageText(message map[string]any) (string, bool) {
+	if content, ok := message["conversation"].(string); ok {
+		return content, true
+	}
+	extended, ok := message["extendedTextMessage"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	content, ok := extended["text"].(string)
+	return content, ok
 }
 
 // ConnectionUpdateData representa uma mudança de estado da conexão.

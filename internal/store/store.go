@@ -150,6 +150,10 @@ func (s *Store) UpdateTenantIntegration(ctx context.Context, t *Tenant) error {
 	if err != nil {
 		return fmt.Errorf("store: encrypt evo token: %w", err)
 	}
+	evoSecretEnc, err := s.cipher.EncryptString(t.EvoWebhookSecret)
+	if err != nil {
+		return fmt.Errorf("store: encrypt evo webhook secret: %w", err)
+	}
 
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE tenants SET
@@ -160,10 +164,11 @@ func (s *Store) UpdateTenantIntegration(ctx context.Context, t *Tenant) error {
 			evo_instance_name = $6,
 			evo_base_url = $7,
 			evo_api_key_enc = $8,
+			evo_webhook_secret_enc = $9,
 			updated_at = now()
 		WHERE id = $1
 	`, t.ID, t.ChatwootAccountID, t.ChatwootBaseURL, chatwootTokenEnc,
-		chatwootSecretEnc, t.EvoInstanceName, t.EvoBaseURL, evoTokenEnc)
+		chatwootSecretEnc, t.EvoInstanceName, t.EvoBaseURL, evoTokenEnc, evoSecretEnc)
 	if err != nil {
 		return fmt.Errorf("store: update tenant integration: %w", err)
 	}
@@ -171,6 +176,19 @@ func (s *Store) UpdateTenantIntegration(ctx context.Context, t *Tenant) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// GetTenantByEvoInstance busca o tenant pela instância Evolution Go. O nome
+// é usado apenas para resolver o tenant antes de validar o segredo da URL.
+func (s *Store) GetTenantByEvoInstance(ctx context.Context, instance string) (*Tenant, error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT id, name, chatwoot_account_id, chatwoot_inbox_id, chatwoot_base_url,
+		       chatwoot_token_enc, chatwoot_hmac_enc,
+		       evo_instance_name, evo_base_url, evo_api_key_enc, evo_webhook_secret_enc,
+		       created_at, updated_at
+		FROM tenants WHERE evo_instance_name = $1
+	`, instance)
+	return s.scanTenant(row)
 }
 
 // GetTenantByChatwootInbox busca tenant pelo inbox_id do Chatwoot.

@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -16,15 +19,18 @@ import (
 )
 
 var (
-	flagTenantName    string
-	flagChatwootURL   string
-	flagChatwootToken string
-	flagChatwootAcct  int
-	flagEvoURL        string
-	flagEvoKey        string
-	flagConnectURL    string
-	flagEvoInstance   string
+	flagTenantName             string
+	flagChatwootURL            string
+	flagChatwootToken          string
+	flagChatwootAcct           int
+	flagEvoURL                 string
+	flagEvoKey                 string
+	flagConnectURL             string
+	flagEvoInstance            string
+	flagRotateEvoWebhookSecret bool
 )
+
+var evoInstanceNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 var setupCmd = &cobra.Command{
 	Use:   "setup",
@@ -52,6 +58,7 @@ func init() {
 	setupCmd.Flags().StringVar(&flagEvoURL, "evo-url", "", "URL base do evolution-go (obrigatório)")
 	setupCmd.Flags().StringVar(&flagEvoKey, "evo-key", "", "token individual da instância Evolution Go (ou env EVO_INSTANCE_TOKEN)")
 	setupCmd.Flags().StringVar(&flagEvoInstance, "evo-instance", "", "nome da instância no evolution-go (obrigatório)")
+	setupCmd.Flags().BoolVar(&flagRotateEvoWebhookSecret, "rotate-evo-webhook-secret", false, "gera e configura um novo segredo de webhook Evolution Go")
 	setupCmd.Flags().StringVar(&flagConnectURL, "connect-url", "", "URL pública deste connector (obrigatório, usada como webhook)")
 	_ = setupCmd.MarkFlagRequired("name")
 	_ = setupCmd.MarkFlagRequired("chatwoot-url")
@@ -72,6 +79,9 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	evoInstanceToken, err := setupCredential(flagEvoKey, "EVO_INSTANCE_TOKEN")
 	if err != nil {
 		return err
+	}
+	if !validEvoInstanceName(flagEvoInstance) {
+		return errors.New("invalid Evolution Go instance name")
 	}
 
 	// Carrega config e store
@@ -112,8 +122,22 @@ func runSetup(cmd *cobra.Command, args []string) error {
 		existing.EvoInstanceName = flagEvoInstance
 		existing.EvoBaseURL = strings.TrimRight(flagEvoURL, "/")
 		existing.EvoAPIKey = evoInstanceToken
+		previousSecret := existing.EvoWebhookSecret
+		candidateSecret := previousSecret
+		if candidateSecret == "" || flagRotateEvoWebhookSecret {
+			candidateSecret, err = newWebhookSecret()
+			if err != nil {
+				return err
+			}
+		}
+		// Configuramos antes de persistir uma rotação. Se o upstream rejeitar
+		// a URL, o segredo anterior continua ativo no banco e no connector.
+		if err := configureEvogoWebhook(ctx, evo, flagConnectURL, existing.EvoInstanceName, candidateSecret); err != nil {
+			return err
+		}
+		existing.EvoWebhookSecret = candidateSecret
 		if err := st.UpdateTenantIntegration(ctx, existing); err != nil {
-			return fmt.Errorf("update existing tenant: %w", err)
+			return fmt.Errorf("Evolution Go webhook configured but tenant update failed; rerun setup immediately to recover: %w", err)
 		}
 		fmt.Printf("✓ Tenant '%s' atualizado sem recriar a inbox (id=%s)\n", existing.Name, existing.ID)
 		return nil
@@ -135,8 +159,12 @@ func runSetup(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("Chatwoot inbox %d created without webhook secret; remove the orphan inbox before retrying", inbox.ID)
 	}
 
-	// 4. Persiste tenant. O webhook Evolution Go → Chatwoot não faz parte
-	// desta etapa e não é configurado até existir um handler de entrada seguro.
+	// 4. Gera URL autenticada por instância e configura só eventos de mensagem.
+	evoWebhookSecret, err := newWebhookSecret()
+	if err != nil {
+		return err
+	}
+	// 5. Persiste tenant e segredo cifrado antes de apontar a Evolution Go.
 	t := &store.Tenant{
 		Name:              flagTenantName,
 		ChatwootAccountID: flagChatwootAcct,
@@ -147,15 +175,58 @@ func runSetup(cmd *cobra.Command, args []string) error {
 		EvoInstanceName:   flagEvoInstance,
 		EvoBaseURL:        strings.TrimRight(flagEvoURL, "/"),
 		EvoAPIKey:         evoInstanceToken,
+		EvoWebhookSecret:  evoWebhookSecret,
 	}
 	if err := st.CreateTenant(ctx, t); err != nil {
 		return fmt.Errorf("persist tenant after creating Chatwoot inbox %d; remove the orphan inbox before retrying: %w", inbox.ID, err)
+	}
+	if err := configureEvogoWebhook(ctx, evo, flagConnectURL, flagEvoInstance, evoWebhookSecret); err != nil {
+		return fmt.Errorf("tenant registered but Evolution Go webhook was not configured; rerun setup: %w", err)
 	}
 	fmt.Printf("✓ Tenant '%s' registrado (id=%s)\n", t.Name, t.ID)
 	fmt.Println()
 	fmt.Println("Próximo passo — adicione um contato:")
 	fmt.Printf("  connect add-contact --tenant %s --jid 5511999999999@s.whatsapp.net --name \"João\"\n", flagTenantName)
 	return nil
+}
+
+func newWebhookSecret() (string, error) {
+	bytes := make([]byte, 32)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", fmt.Errorf("generate Evolution webhook secret: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(bytes), nil
+}
+
+func configureEvogoWebhook(ctx context.Context, evo *evogo.Client, connectURL, instance, secret string) error {
+	webhookURL := strings.TrimRight(connectURL, "/") + "/webhook/evo/" + instance + "/" + secret
+	response, err := evo.Connect(ctx, evogo.ConnectRequest{WebhookURL: webhookURL, Subscribe: []string{"MESSAGES_UPSERT"}, Immediate: true})
+	if err != nil {
+		return fmt.Errorf("configure Evolution Go webhook: %w", err)
+	}
+	if response.Data.WebhookURL == "" || response.Data.WebhookURL != webhookURL {
+		return errors.New("Evolution Go returned a different webhook URL")
+	}
+	if !hasMessagesUpsert(response.Data.EventString) {
+		return errors.New("Evolution Go did not confirm MESSAGES_UPSERT subscription")
+	}
+	fmt.Println("✓ Webhook Evolution Go configurado para mensagens recebidas")
+	return nil
+}
+
+func validEvoInstanceName(name string) bool {
+	return evoInstanceNamePattern.MatchString(name)
+}
+
+func hasMessagesUpsert(eventString string) bool {
+	for _, item := range strings.FieldsFunc(strings.ToUpper(eventString), func(r rune) bool {
+		return r < 'A' || r > 'Z'
+	}) {
+		if item == "MESSAGES" { // "MESSAGES_UPSERT" is split at underscore.
+			return strings.Contains(strings.ToUpper(eventString), "MESSAGES_UPSERT")
+		}
+	}
+	return strings.Contains(strings.ToUpper(eventString), "MESSAGES_UPSERT")
 }
 
 // setupCredential prioriza a flag para compatibilidade e usa env como caminho

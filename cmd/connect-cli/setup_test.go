@@ -31,3 +31,15 @@ func TestSetupCredentialRequiresValue(t *testing.T) {
 
 	assert.EqualError(t, err, "credential missing: use the corresponding flag or env CHATWOOT_TOKEN")
 }
+
+func TestValidEvoInstanceName(t *testing.T) {
+	assert.True(t, validEvoInstanceName("demo_01-A"))
+	for _, invalid := range []string{"", " space", "demo/path", "demo?x", "démö"} {
+		assert.False(t, validEvoInstanceName(invalid))
+	}
+}
+
+func TestHasMessagesUpsert(t *testing.T) {
+	assert.True(t, hasMessagesUpsert("MESSAGES_UPSERT, CONNECTION_UPDATE"))
+	assert.False(t, hasMessagesUpsert("MESSAGES_UPDATE"))
+}

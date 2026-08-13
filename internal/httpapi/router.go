@@ -35,6 +35,7 @@ type Deps struct {
 type HTTPStore interface {
 	Ping(context.Context) error
 	GetTenantByChatwootInbox(context.Context, int) (*store.Tenant, error)
+	GetTenantByEvoInstance(context.Context, string) (*store.Tenant, error)
 	SetPaused(context.Context, bool, string) error
 	IsPaused(context.Context) (bool, error)
 	ListTenants(context.Context) ([]store.Tenant, error)
@@ -63,6 +64,7 @@ func NewRouter(d Deps) *gin.Engine {
 
 	// Webhook do Chatwoot (Etapa 1)
 	r.POST("/webhook/chatwoot", chatwootWebhookHandler(d))
+	r.POST("/webhook/evo/:instance/:secret", evogoWebhookHandler(d))
 
 	// Admin
 	admin := r.Group("/admin", adminAuth(d.AdminToken))

@@ -61,7 +61,7 @@ func TestClientConnectAndStatusContracts(t *testing.T) {
 		switch r.URL.Path {
 		case "/instance/connect":
 			assert.Equal(t, http.MethodPost, r.Method)
-			_, _ = w.Write([]byte(`{"message":"success","data":{"jid":"5511@s.whatsapp.net"}}`))
+			_, _ = w.Write([]byte(`{"message":"success","data":{"jid":"5511@s.whatsapp.net","webhookUrl":"https://connector.example/webhook/evo/demo/secret","eventString":"MESSAGES_UPSERT"}}`))
 		case "/instance/status":
 			assert.Equal(t, http.MethodGet, r.Method)
 			_, _ = w.Write([]byte(`{"message":"success","data":{"name":"demo","connected":true,"loggedIn":true}}`))

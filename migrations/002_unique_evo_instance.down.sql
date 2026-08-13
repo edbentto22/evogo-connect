@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_tenants_evo_instance_name_unique;

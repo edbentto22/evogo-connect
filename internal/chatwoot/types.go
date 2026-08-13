@@ -211,6 +211,33 @@ type ConversationResponse struct {
 	Status    string `json:"status"`
 }
 
+// ConversationListResponse é o envelope paginado da listagem de conversas.
+type ConversationListResponse struct {
+	Data []ConversationResponse `json:"data"`
+}
+
+// UnmarshalJSON aceita as duas respostas usadas pelo Chatwoot e pelo fork
+// Fazer.ai: `data: [...]` e `data: { payload: [...] }`.
+func (r *ConversationListResponse) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("decode conversations response: %w", err)
+	}
+	if err := json.Unmarshal(raw.Data, &r.Data); err == nil {
+		return nil
+	}
+	var wrapped struct {
+		Payload []ConversationResponse `json:"payload"`
+	}
+	if err := json.Unmarshal(raw.Data, &wrapped); err != nil {
+		return fmt.Errorf("decode conversations response data: %w", err)
+	}
+	r.Data = wrapped.Payload
+	return nil
+}
+
 // ─── Create message (POST /api/v1/accounts/{account_id}/conversations/{cid}/messages) ───
 
 // MessageCreatePayload é o body para criar mensagem (incoming de cliente).

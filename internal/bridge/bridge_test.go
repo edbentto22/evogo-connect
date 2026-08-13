@@ -17,6 +17,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/edbentto22/evogo-connect/internal/chatwoot"
+	"github.com/edbentto22/evogo-connect/internal/evogo"
 	"github.com/edbentto22/evogo-connect/internal/store"
 )
 
@@ -52,6 +53,12 @@ func (s *memoryBridgeStore) GetTenantByChatwootInbox(_ context.Context, inboxID 
 	}
 	return s.tenant, nil
 }
+
+func (s *memoryBridgeStore) GetContactByJID(_ context.Context, _ uuid.UUID, _ string) (*store.ContactMap, error) {
+	return nil, store.ErrNotFound
+}
+
+func (s *memoryBridgeStore) CreateContact(context.Context, *store.ContactMap) error { return nil }
 
 func (s *memoryBridgeStore) ClaimIdempotency(_ context.Context, direction, key string, _ uuid.UUID, _ time.Duration, claimToken string) (store.IdempotencyClaim, error) {
 	s.mu.Lock()
@@ -139,6 +146,82 @@ func TestHandleChatwootWebhookSendsTextExactlyOnce(t *testing.T) {
 	require.Len(t, st.audits, 1)
 	assert.NotEqual(t, env.Conversation.ContactInbox.SourceID, st.audits[0].JID)
 	assert.NotContains(t, st.audits[0].ErrorDetail, env.Content)
+}
+
+func TestHandleEvogoWebhookPublishesIncomingExactlyOnce(t *testing.T) {
+	var createContact, createInbox, createConversation, createMessage atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/accounts/1/contacts/search":
+			_, _ = w.Write([]byte(`{"payload":[]}`))
+		case "/api/v1/accounts/1/contacts":
+			createContact.Add(1)
+			_, _ = w.Write([]byte(`{"payload":{"contact":{"id":44,"identifier":"5511999999999@s.whatsapp.net"}}}`))
+		case "/api/v1/accounts/1/contacts/44/contact_inboxes":
+			createInbox.Add(1)
+			_, _ = w.Write([]byte(`{"id":3,"source_id":"5511999999999@s.whatsapp.net","inbox":{"id":7}}`))
+		case "/api/v1/accounts/1/conversations":
+			if r.Method == http.MethodGet {
+				_, _ = w.Write([]byte(`{"data":[]}`))
+				return
+			}
+			createConversation.Add(1)
+			_, _ = w.Write([]byte(`{"id":91,"account_id":1,"inbox_id":7,"status":"open"}`))
+		case "/api/v1/accounts/1/conversations/91/messages":
+			createMessage.Add(1)
+			var payload chatwoot.MessageCreatePayload
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+			assert.Equal(t, "incoming", payload.MessageType)
+			assert.Equal(t, "olá", payload.Content)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	st := newMemoryBridgeStore("http://unused.invalid")
+	st.tenant.ChatwootBaseURL = server.URL
+	st.tenant.ChatwootAccountID = 1
+	st.tenant.ChatwootToken = "cw-token"
+	env := evogo.WebhookEnvelope{Event: "MESSAGES_UPSERT", Data: json.RawMessage(`{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":false,"id":"EVO-1"},"pushName":"João","message":{"conversation":"olá"},"messageType":"conversation"}`)}
+	core := New(st, 24*time.Hour, false, 0)
+	require.NoError(t, core.HandleEvogoWebhook(context.Background(), st.tenant, env))
+	require.NoError(t, core.HandleEvogoWebhook(context.Background(), st.tenant, env))
+	assert.Equal(t, int32(1), createContact.Load())
+	assert.Equal(t, int32(1), createInbox.Load())
+	assert.Equal(t, int32(1), createConversation.Load())
+	assert.Equal(t, int32(1), createMessage.Load())
+	assert.Len(t, st.audits, 1)
+	assert.Equal(t, "w2c", st.audits[0].Direction)
+}
+
+func TestHandleEvogoWebhookSkipsOwnGroupsAndMedia(t *testing.T) {
+	st := newMemoryBridgeStore("http://unused.invalid")
+	core := New(st, time.Hour, false, 0)
+	for _, data := range []string{
+		`{"key":{"remoteJid":"5511@s.whatsapp.net","fromMe":true,"id":"1"},"message":{"conversation":"x"},"messageType":"conversation"}`,
+		`{"key":{"remoteJid":"123@g.us","fromMe":false,"id":"2"},"message":{"conversation":"x"},"messageType":"conversation"}`,
+		`{"key":{"remoteJid":"5511@s.whatsapp.net","fromMe":false,"id":"3"},"message":{"imageMessage":{}},"messageType":"imageMessage"}`,
+	} {
+		err := core.HandleEvogoWebhook(context.Background(), st.tenant, evogo.WebhookEnvelope{Event: "MESSAGE", Data: json.RawMessage(data)})
+		require.ErrorIs(t, err, ErrSkipped)
+	}
+}
+
+func TestHandleEvogoWebhookReleasesClaimAfterChatwootFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	st := newMemoryBridgeStore("http://unused.invalid")
+	st.tenant.ChatwootBaseURL = server.URL
+	st.tenant.ChatwootAccountID = 1
+	err := New(st, time.Hour, false, 0).HandleEvogoWebhook(context.Background(), st.tenant, evogo.WebhookEnvelope{
+		Event: "MESSAGE", Data: json.RawMessage(`{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":false,"id":"retry-1"},"message":{"conversation":"olá"},"messageType":"conversation"}`),
+	})
+	require.Error(t, err)
+	assert.Equal(t, "failed", st.claims["w2c:w2c:demo:retry-1"])
+	require.Len(t, st.audits, 1)
+	assert.Equal(t, "chatwoot_send_failed", st.audits[0].ErrorCode)
 }
 
 func TestHandleChatwootWebhookAcceptsFazerAIOutgoingEvent(t *testing.T) {

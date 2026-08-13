@@ -198,3 +198,24 @@ func TestClientDoesNotForwardTokenAcrossRedirect(t *testing.T) {
 	require.Error(t, err)
 	assert.Empty(t, leaked)
 }
+
+func TestFindOpenConversationAcceptsFazerAIPayloadAndPaginates(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "/api/v1/accounts/1/conversations", r.URL.Path)
+		assert.Equal(t, "44", r.URL.Query().Get("contact_id"))
+		assert.Equal(t, "7", r.URL.Query().Get("inbox_id"))
+		switch r.URL.Query().Get("page") {
+		case "1":
+			_, _ = w.Write([]byte(`{"data":{"payload":[{"id":2,"inbox_id":7,"status":"resolved"}]}}`))
+		case "2":
+			_, _ = w.Write([]byte(`{"data":[{"id":3,"inbox_id":7,"status":"open"}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	conversation, err := NewClient(server.URL, 1, "token").FindOpenConversation(context.Background(), 44, 7)
+	require.NoError(t, err)
+	assert.Equal(t, 3, conversation.ID)
+}

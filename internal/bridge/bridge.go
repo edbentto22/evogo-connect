@@ -72,6 +72,7 @@ type Core struct {
 type BridgeStore interface {
 	IsPaused(context.Context) (bool, error)
 	GetTenantByChatwootInbox(context.Context, int) (*store.Tenant, error)
+	CreateContact(context.Context, *store.ContactMap) error
 	ClaimIdempotency(context.Context, string, string, uuid.UUID, time.Duration, string) (store.IdempotencyClaim, error)
 	CompleteDelivery(context.Context, string, string, string, []byte, time.Duration, store.BridgeLogEntry) error
 	ReleaseIdempotency(context.Context, string, string, string) error
@@ -299,6 +300,90 @@ func (c *Core) HandleChatwootWebhook(ctx context.Context, env chatwoot.WebhookEn
 		"content_hash", applog.ContentHash(env.Content),
 		"latency_ms", latency.Milliseconds(),
 	)
+	return nil
+}
+
+// HandleEvogoWebhook encaminha uma mensagem direta recebida da Evolution Go
+// para a inbox API correspondente do Chatwoot. O handler HTTP já autenticou o
+// segredo da URL; este método continua aplicando kill switch, idempotência,
+// rate limit e auditoria antes do efeito externo.
+func (c *Core) HandleEvogoWebhook(ctx context.Context, tenant *store.Tenant, env evogo.WebhookEnvelope) error {
+	start := time.Now()
+	paused, err := c.IsPaused(ctx)
+	if err != nil {
+		slog.Warn("bridge: failed to check pause, using env", "err", err)
+		paused = c.Paused
+	}
+	if paused {
+		metrics.BridgeMessages.WithLabelValues(string(DirW2C), "paused").Inc()
+		return ErrPaused
+	}
+
+	message, content, process, err := env.IncomingText()
+	if err != nil {
+		metrics.BridgeErrors.WithLabelValues("invalid_evo_payload", "bridge").Inc()
+		return fmt.Errorf("bridge: validate Evolution Go webhook: %w", err)
+	}
+	if !process {
+		metrics.BridgeMessages.WithLabelValues(string(DirW2C), "skipped_event").Inc()
+		return ErrSkipped
+	}
+	jid, _, err := evogo.ParseDirectJID(message.Key.RemoteJID)
+	if err != nil {
+		metrics.BridgeErrors.WithLabelValues("invalid_jid", "bridge").Inc()
+		return fmt.Errorf("bridge: validate incoming JID: %w", err)
+	}
+	if c.LimitPerMin > 0 && !c.getLimiter(tenant.ID, DirW2C).Allow() {
+		metrics.BridgeMessages.WithLabelValues(string(DirW2C), "rate_limited").Inc()
+		return ErrRateLimited
+	}
+
+	idempKey := fmt.Sprintf("w2c:%s:%s", tenant.Name, message.Key.ID)
+	claimToken := uuid.NewString()
+	claimState, err := c.Store.ClaimIdempotency(ctx, string(DirW2C), idempKey, tenant.ID, 2*time.Minute, claimToken)
+	if err != nil {
+		return fmt.Errorf("bridge: claim incoming idempotency: %w", err)
+	}
+	if claimState == store.ClaimCompleted {
+		metrics.IdempotencyHits.Inc()
+		metrics.BridgeMessages.WithLabelValues(string(DirW2C), "skipped_duplicate").Inc()
+		return nil
+	}
+	if claimState == store.ClaimInProgress {
+		return ErrInProgress
+	}
+
+	cw := chatwoot.NewClient(tenant.ChatwootBaseURL, tenant.ChatwootAccountID, tenant.ChatwootToken)
+	contact, conversation, sendErr := cw.EnsureContactConversation(ctx, strings.TrimSpace(message.PushName), jid, tenant.ChatwootInboxID)
+	if sendErr == nil {
+		sendErr = cw.CreateIncomingMessage(ctx, int64(conversation.ID), content, "text")
+	}
+	latency := int(time.Since(start).Milliseconds())
+	if sendErr != nil {
+		metrics.BridgeErrors.WithLabelValues("chatwoot_send_failed", "bridge").Inc()
+		metrics.BridgeMessages.WithLabelValues(string(DirW2C), "error").Inc()
+		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		releaseErr := c.Store.ReleaseIdempotency(persistCtx, string(DirW2C), idempKey, claimToken)
+		auditErr := c.logAudit(persistCtx, tenant.ID, DirW2C, message.Key.ID, jid, []byte(applog.ContentHash(content)), "error", "chatwoot_send_failed", "falha ao publicar no Chatwoot", latency)
+		return errors.Join(fmt.Errorf("bridge: send incoming to Chatwoot: %w", sendErr), releaseErr, auditErr)
+	}
+	detail := json.RawMessage(fmt.Sprintf(`{"conversation_id":%d,"latency_ms":%d}`, conversation.ID, latency))
+	audit := c.newAuditEntry(tenant.ID, DirW2C, message.Key.ID, jid, []byte(applog.ContentHash(content)), "ok", "", "", latency)
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := c.Store.CompleteDelivery(persistCtx, string(DirW2C), idempKey, claimToken, detail, c.IdempotencyTTL, audit); err != nil {
+		return fmt.Errorf("bridge: complete incoming delivery: %w", err)
+	}
+	// O mapeamento é uma otimização administrativa; a entrega já foi
+	// confirmada de forma atômica com a auditoria. Não retornamos erro (e
+	// portanto não pedimos retry) depois de publicar a mensagem no Chatwoot.
+	if err := c.Store.CreateContact(persistCtx, &store.ContactMap{TenantID: tenant.ID, JID: jid, ChatwootContactID: contact.ID, SourceID: jid, DisplayName: ""}); err != nil {
+		slog.Warn("bridge: could not persist incoming contact map", "tenant", tenant.Name, "err", err)
+	}
+	metrics.BridgeMessages.WithLabelValues(string(DirW2C), "ok").Inc()
+	metrics.BridgeLatency.WithLabelValues(string(DirW2C)).Observe(time.Since(start).Seconds())
+	slog.Info("bridge: w2c delivered", "tenant", tenant.Name, "jid_masked", applog.MaskPhone(jid), "content_hash", applog.ContentHash(content), "latency_ms", latency)
 	return nil
 }
 

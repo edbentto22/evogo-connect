@@ -53,3 +53,26 @@ func TestWebhookEnvelopeDecode(t *testing.T) {
 	assert.Equal(t, "MESSAGES_UPSERT", env.Event)
 	assert.Equal(t, "demo", env.Instance)
 }
+
+func TestWebhookEnvelopeIncomingTextContract(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGES_UPSERT","instance":"demo","data":{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":false,"id":"ABC"},"message":{"conversation":"olá"},"messageType":"conversation"}}`), &env))
+	message, content, accepted, err := env.IncomingText()
+	require.NoError(t, err)
+	assert.True(t, accepted)
+	assert.Equal(t, "ABC", message.Key.ID)
+	assert.Equal(t, "olá", content)
+}
+
+func TestWebhookEnvelopeIncomingTextSupportsExtendedTextAndSkipsBroadcasts(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"key":{"remoteJid":"5511@s.whatsapp.net","id":"x"},"message":{"extendedTextMessage":{"text":"oi"}},"messageType":"extendedTextMessage"}}`), &env))
+	_, content, accepted, err := env.IncomingText()
+	require.NoError(t, err)
+	assert.True(t, accepted)
+	assert.Equal(t, "oi", content)
+	env.Data = json.RawMessage(`{"key":{"remoteJid":"status@broadcast","id":"x"},"message":{"conversation":"oi"},"messageType":"conversation"}`)
+	_, _, accepted, err = env.IncomingText()
+	require.NoError(t, err)
+	assert.False(t, accepted)
+}

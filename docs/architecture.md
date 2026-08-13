@@ -2,8 +2,7 @@
 
 ## Visão geral
 
-O `evogo-connect` será um bridge HTTP bidirecional entre dois sistemas. Na
-Etapa 1, somente o sentido Chatwoot → WhatsApp está ativo:
+O `evogo-connect` é um bridge HTTP bidirecional entre dois sistemas:
 
 - **evolution-go** (provedor WhatsApp via whatsmeow) — REST + WebSocket
 - **Chatwoot** (plataforma de atendimento self-hosted) — REST + Webhooks
@@ -13,7 +12,7 @@ O connector **não** altera o código de nenhum dos dois lados. Nesta etapa ele:
 - Cria uma inbox API no Chatwoot apontando para `/webhook/chatwoot`.
 - Persiste o `secret` da inbox e o token individual da instância Evolution Go.
 - Cria o contato e o vínculo `contact_inbox` com `source_id = JID`.
-- Não configura webhook de entrada no Evolution Go até a Etapa 2.
+- Configura um webhook exclusivo por instância na Evolution Go.
 
 ## Diagrama
 
@@ -37,7 +36,7 @@ cmd/evogo-connect/main.go   — entry point, graceful shutdown
         ▼
 internal/bridge             — core: resolve tenant → contact → JID → send
    ├── HandleChatwootWebhook (Etapa 1)
-   └── HandleEvoWebhook      (Etapa 2 — futuro)
+   └── HandleEvogoWebhook    (WhatsApp → Chatwoot)
         │
         ├─► internal/store    — pgxpool (tenants, contact_map, idempotency, audit)
         ├─► internal/crypto   — AES-GCM (segredos em repouso)
@@ -48,7 +47,7 @@ internal/bridge             — core: resolve tenant → contact → JID → sen
         │
 internal/httpapi            — Gin router
    ├── /webhook/chatwoot     — entrada de msgs outgoing do Chatwoot
-   ├── /webhook/evo/:inst    — entrada de msgs do evolution-go (Etapa 2)
+   ├── /webhook/evo/:inst/:secret — entrada autenticada de msgs do evolution-go
    ├── /admin/*              — kill switch, listagem
    ├── /healthz, /readyz     — health probes
    └── /metrics              — Prometheus exposition
@@ -91,16 +90,16 @@ webhook for reenviado manualmente ou por automação externa, a idempotência
 garante que uma entrega concluída não seja duplicada; claims ainda em
 processamento retornam erro reenviável, não um falso 200.
 
-## Fluxo: cliente manda msg WhatsApp → agente recebe no Chatwoot (Etapa 2 — futuro)
+## Fluxo: cliente manda texto WhatsApp → agente recebe no Chatwoot
 
-(planejado; ainda não implementado)
-
-1. Evolution Go dispara eventos no webhook que será configurado na Etapa 2.
-2. evogo-connect valida `X-Evogo-Secret` (replay window 5 min).
-3. Get-or-create contact no Chatwoot com `source_id = remoteJid`.
-4. Get-or-create conversation (status=open).
-5. POST message incoming no Chatwoot.
-6. Mídia: download da URL evolution-go + upload multipart Chatwoot.
+1. Evolution Go envia `MESSAGES_UPSERT` para a URL exclusiva da instância.
+2. O conector valida o segredo no caminho em tempo constante e limita o body.
+3. Aceita apenas texto direto recebido (`fromMe=false`); grupos, mídia e
+   eventos desconhecidos retornam 200 sem efeito.
+4. O core cria/reutiliza contato e vínculo da inbox, publica uma mensagem
+   `incoming`, registra o mapeamento e conclui a idempotência/auditoria.
+5. Falhas conhecidas do Chatwoot retornam 503 e liberam retry; timeout de rede
+   mantém o claim para reduzir risco de duplicação.
 
 ## Modelo de dados (Postgres)
 

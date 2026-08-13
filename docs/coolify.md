@@ -144,7 +144,21 @@ Antes de liberar tráfego real:
 7. Execute `scripts/smoke-e2e.sh` de uma estação autorizada, com as
    credenciais das instâncias homologadas.
 
-O fluxo WhatsApp → Chatwoot ainda não existe nesta etapa.
+7. Envie um texto do WhatsApp pareado para a instância. Ele deve aparecer como
+   mensagem recebida na inbox correspondente do Chatwoot; os logs mostram
+   `bridge: w2c delivered` sem exibir conteúdo ou telefone completo.
+
+O `connect setup` configura automaticamente uma URL de webhook exclusiva por
+instância na Evolution Go. O segredo fica cifrado no Postgres e não aparece em
+`connect status` nem nos logs do conector. Não configure um webhook global ou
+uma URL manual na Evolution Go. Para rotacionar o segredo, execute novamente
+`connect setup` com o mesmo `--name` e `--rotate-evo-webhook-secret`; limite o
+acesso aos logs do proxy/Coolify, pois o caminho completo da URL pode aparecer
+nos registros.
+
+Após atualizar para esta versão, execute `connect setup` novamente para cada
+tenant existente (mesmo `--name` e credenciais temporárias). Isso grava o
+segredo cifrado e registra o webhook Evolution Go; não recria a inbox.
 
 ## 5. Backup e restore
 
