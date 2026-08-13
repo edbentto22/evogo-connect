@@ -94,8 +94,9 @@ processamento retornam erro reenviável, não um falso 200.
 
 1. Evolution Go envia o evento de mensagem (`MESSAGE` ou `MESSAGES_UPSERT`) para a URL exclusiva da instância.
 2. O conector valida o segredo no caminho em tempo constante e limita o body.
-3. Aceita apenas texto direto recebido (`fromMe=false`); grupos, mídia e
-   eventos desconhecidos retornam 200 sem efeito.
+3. Aceita apenas texto direto recebido (`fromMe=false` ou `info.isFromMe=false`);
+   os formatos `key` e `info` da Evolution Go são normalizados. Grupos, mídia
+   e eventos desconhecidos retornam 200 sem efeito.
 4. O core cria/reutiliza contato e vínculo da inbox, publica uma mensagem
    `incoming`, registra o mapeamento e conclui a idempotência/auditoria.
 5. Falhas conhecidas do Chatwoot retornam 503 e liberam retry; timeout de rede

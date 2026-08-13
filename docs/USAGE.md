@@ -122,8 +122,9 @@ O que aconteceu:
    `CONNECT_MASTER_KEY`).
 5. A Evolution Go recebe uma URL exclusiva por instância, com o segredo no
    caminho e assinatura apenas da categoria `MESSAGE` (o evento recebido pode
-   ser chamado de `MESSAGE` ou `MESSAGES_UPSERT`). Não copie a URL para logs,
-   tickets ou chats.
+   ser chamado de `MESSAGE` ou `MESSAGES_UPSERT`). O conector aceita tanto o
+   formato de chave `data.key` quanto o formato nativo `data.info` documentado
+   pela Evolution Go. Não copie a URL para logs, tickets ou chats.
 
 ---
 

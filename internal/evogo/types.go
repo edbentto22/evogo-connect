@@ -18,13 +18,23 @@ type WebhookEnvelope struct {
 type MessagesUpsertData struct {
 	Key struct {
 		RemoteJID string `json:"remoteJid"`
-		FromMe    bool   `json:"fromMe"`
+		FromMe    *bool  `json:"fromMe"`
 		ID        string `json:"id"`
 	} `json:"key"`
 	PushName         string         `json:"pushName"`
 	Message          map[string]any `json:"message"`
 	MessageType      string         `json:"messageType"`
 	MessageTimestamp int64          `json:"messageTimestamp"`
+	// Info é o formato emitido por versões recentes do Evolution Go, baseado
+	// diretamente em whatsmeow. Ele é mantido ao lado de Key para preservar a
+	// compatibilidade com os dois contratos de webhook.
+	Info struct {
+		ID       string          `json:"id"`
+		Chat     json.RawMessage `json:"chat"`
+		Sender   json.RawMessage `json:"sender"`
+		IsFromMe *bool           `json:"isFromMe"`
+		PushName string          `json:"pushName"`
+	} `json:"info"`
 }
 
 // IncomingText extrai somente o contrato seguro de mensagem direta em texto.
@@ -51,8 +61,9 @@ func (e WebhookEnvelope) IncomingTextWithReason() (MessagesUpsertData, string, s
 	if err := json.Unmarshal(e.Data, &data); err != nil {
 		return zero, "", "invalid_payload", false, fmt.Errorf("evogo: decode message data: %w", err)
 	}
+	normalizeMessageInfo(&data)
 	jid := strings.ToLower(strings.TrimSpace(data.Key.RemoteJID))
-	if data.Key.FromMe {
+	if data.isFromMe() {
 		return data, "", "own_message", false, nil
 	}
 	if strings.HasSuffix(jid, "@g.us") || strings.HasSuffix(jid, "@broadcast") || strings.HasSuffix(jid, "@newsletter") {
@@ -66,9 +77,93 @@ func (e WebhookEnvelope) IncomingTextWithReason() (MessagesUpsertData, string, s
 		return data, "", "unsupported_message_structure", false, nil
 	}
 	if strings.TrimSpace(data.Key.ID) == "" || strings.TrimSpace(data.Key.RemoteJID) == "" {
-		return zero, "", "invalid_payload", false, fmt.Errorf("evogo: message key is required")
+		return zero, "", "invalid_payload", false, fmt.Errorf("evogo: message key is required (%s)", webhookDataShape(e.Data))
 	}
 	return data, content, "", true, nil
+}
+
+// normalizeMessageInfo adapta o payload nativo do Evolution Go (info) para o
+// contrato interno usado pelo bridge. A chave legada tem precedência quando
+// estiver completa.
+func normalizeMessageInfo(data *MessagesUpsertData) {
+	if strings.TrimSpace(data.Key.ID) == "" {
+		data.Key.ID = data.Info.ID
+	}
+	if strings.TrimSpace(data.Key.RemoteJID) == "" {
+		data.Key.RemoteJID = selectInfoJID(data.Info.Chat, data.Info.Sender)
+	}
+	if strings.TrimSpace(data.PushName) == "" {
+		data.PushName = data.Info.PushName
+	}
+}
+
+// isFromMe é deliberadamente conservador: se qualquer contrato disponível
+// identificar a mensagem como própria, ela jamais é encaminhada ao Chatwoot.
+func (data MessagesUpsertData) isFromMe() bool {
+	return data.Key.FromMe != nil && *data.Key.FromMe || data.Info.IsFromMe != nil && *data.Info.IsFromMe
+}
+
+func selectInfoJID(chatRaw, senderRaw json.RawMessage) string {
+	chat := webhookJID(chatRaw)
+	if isNonDirectJID(chat) || isDirectJID(chat) {
+		return chat
+	}
+	sender := webhookJID(senderRaw)
+	if isDirectJID(sender) {
+		return sender
+	}
+	if chat != "" {
+		return chat
+	}
+	return sender
+}
+
+func isDirectJID(jid string) bool {
+	return strings.HasSuffix(strings.ToLower(strings.TrimSpace(jid)), "@s.whatsapp.net")
+}
+
+func isNonDirectJID(jid string) bool {
+	jid = strings.ToLower(strings.TrimSpace(jid))
+	return strings.HasSuffix(jid, "@g.us") || strings.HasSuffix(jid, "@broadcast") || strings.HasSuffix(jid, "@newsletter")
+}
+
+// webhookJID converte o JID serializado pela Evolution Go, aceitando tanto o
+// objeto documentado {user, server} quanto uma representação textual.
+func webhookJID(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err == nil {
+		return strings.TrimSpace(value)
+	}
+	var jid struct {
+		User   string `json:"user"`
+		Server string `json:"server"`
+	}
+	if err := json.Unmarshal(raw, &jid); err != nil {
+		return ""
+	}
+	user := strings.TrimSpace(jid.User)
+	server := strings.TrimSpace(jid.Server)
+	if user == "" || server == "" {
+		return ""
+	}
+	return user + "@" + server
+}
+
+// webhookDataShape descreve somente a presença de campos estruturais esperados.
+// Nunca inclui valores recebidos, preservando conteúdo, JID e nome do contato.
+func webhookDataShape(raw json.RawMessage) string {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return "data_not_object"
+	}
+	_, hasKey := object["key"]
+	_, hasMessage := object["message"]
+	_, hasData := object["data"]
+	_, hasInfo := object["info"]
+	return fmt.Sprintf("has_key=%t has_message=%t has_data=%t has_info=%t", hasKey, hasMessage, hasData, hasInfo)
 }
 
 func incomingMessageText(message map[string]any) (string, bool) {
