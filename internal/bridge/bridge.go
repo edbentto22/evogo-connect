@@ -122,12 +122,13 @@ func (c *Core) IsPaused(ctx context.Context) (bool, error) {
 
 // ─── Etapa 1: Chatwoot → WhatsApp (reverse) ─────────────────────────────
 
-// HandleChatwootWebhook processa um webhook do Chatwoot (MessageCreated de
-// outgoing). Retorna ErrSkipped/ErrPaused/ErrRateLimited para casos não-erro.
+// HandleChatwootWebhook processa um webhook de mensagem outgoing do Chatwoot.
+// Além de message_created, aceita message_outgoing, evento adicional emitido
+// pelo fork fazer.ai com o mesmo message.webhook_data.
 //
 // Fluxo:
 //  1. Verifica kill switch
-//  2. Filtra: só processa message_created + outgoing + !private
+//  2. Filtra: só processa eventos de mensagem criada/saída + outgoing + !private
 //  3. Resolve tenant pelo inbox_id
 //  4. Resolve JID via contact_inbox.source_id
 //  5. Adquire claim idempotente por chatwoot_message_id
@@ -154,8 +155,8 @@ func (c *Core) HandleChatwootWebhook(ctx context.Context, env chatwoot.WebhookEn
 	}
 
 	// 2. Filtro de evento
-	if env.Event != "message_created" {
-		metrics.BridgeMessages.WithLabelValues(string(DirC2W), "skipped_event").Inc()
+	if env.Event != "message_created" && env.Event != "message_outgoing" {
+		metrics.BridgeMessages.WithLabelValues(string(DirC2W), skippedEventStatus(env.Event)).Inc()
 		return fmt.Errorf("%w: event=%s", ErrSkipped, env.Event)
 	}
 	if env.MessageType != "outgoing" {
@@ -165,6 +166,10 @@ func (c *Core) HandleChatwootWebhook(ctx context.Context, env chatwoot.WebhookEn
 	if env.Private {
 		metrics.BridgeMessages.WithLabelValues(string(DirC2W), "skipped_private").Inc()
 		return fmt.Errorf("%w: private note", ErrSkipped)
+	}
+	if env.ID <= 0 {
+		metrics.BridgeErrors.WithLabelValues("invalid_message_id", "bridge").Inc()
+		return fmt.Errorf("bridge: invalid Chatwoot message id %d", env.ID)
 	}
 
 	// 3. Resolve tenant
@@ -282,6 +287,23 @@ func (c *Core) HandleChatwootWebhook(ctx context.Context, env chatwoot.WebhookEn
 		"latency_ms", latency.Milliseconds(),
 	)
 	return nil
+}
+
+func skippedEventStatus(event string) string {
+	switch event {
+	case "message_updated":
+		return "skipped_message_updated"
+	case "conversation_created":
+		return "skipped_conversation_created"
+	case "conversation_updated":
+		return "skipped_conversation_updated"
+	case "conversation_status_changed":
+		return "skipped_conversation_status_changed"
+	case "conversation_typing_on", "conversation_typing_off", "conversation_recording":
+		return "skipped_conversation_activity"
+	default:
+		return "skipped_event"
+	}
 }
 
 func attachmentFilename(att chatwoot.Attachment) string {

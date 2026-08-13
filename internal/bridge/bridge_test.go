@@ -141,6 +141,139 @@ func TestHandleChatwootWebhookSendsTextExactlyOnce(t *testing.T) {
 	assert.NotContains(t, st.audits[0].ErrorDetail, env.Content)
 }
 
+func TestHandleChatwootWebhookAcceptsFazerAIOutgoingEvent(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		assert.Equal(t, "/send/text", r.URL.Path)
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		assert.Equal(t, "5511999999999", body["number"])
+		assert.Equal(t, "teste fazer.ai", body["text"])
+		assert.NotEmpty(t, body["id"])
+		_, _ = w.Write([]byte(`{"status":"sent"}`))
+	}))
+	defer server.Close()
+
+	st := newMemoryBridgeStore(server.URL)
+	core := New(st, 24*time.Hour, false, 0)
+	var env chatwoot.WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"event":"message_outgoing",
+		"id":123,
+		"content":"teste fazer.ai",
+		"message_type":"outgoing",
+		"private":false,
+		"created_at":"2026-08-13T14:08:02.000Z",
+		"conversation":{
+			"id":456,
+			"inbox_id":7,
+			"contact_inbox":{
+				"inbox_id":7,
+				"source_id":"5511999999999@s.whatsapp.net"
+			}
+		}
+	}`), &env))
+	require.NoError(t, core.HandleChatwootWebhook(context.Background(), env))
+
+	// O fork pode entregar message_outgoing e message_created para a mesma
+	// mensagem. O ID compartilhado mantém o efeito externo exatamente uma vez.
+	env.Event = "message_created"
+	require.NoError(t, core.HandleChatwootWebhook(context.Background(), env))
+	assert.Equal(t, int32(1), calls.Load())
+}
+
+func TestHandleChatwootWebhookDeduplicatesFazerAIEventsInEitherOrder(t *testing.T) {
+	for _, first := range []string{"message_created", "message_outgoing"} {
+		t.Run(first, func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls.Add(1)
+				_, _ = w.Write([]byte(`{"status":"sent"}`))
+			}))
+			defer server.Close()
+
+			core := New(newMemoryBridgeStore(server.URL), 24*time.Hour, false, 0)
+			env := validEnvelope()
+			env.Event = first
+			require.NoError(t, core.HandleChatwootWebhook(context.Background(), env))
+			if first == "message_created" {
+				env.Event = "message_outgoing"
+			} else {
+				env.Event = "message_created"
+			}
+			require.NoError(t, core.HandleChatwootWebhook(context.Background(), env))
+			assert.Equal(t, int32(1), calls.Load())
+		})
+	}
+}
+
+func TestHandleChatwootWebhookDeduplicatesConcurrentFazerAIEvents(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		time.Sleep(20 * time.Millisecond)
+		_, _ = w.Write([]byte(`{"status":"sent"}`))
+	}))
+	defer server.Close()
+
+	core := New(newMemoryBridgeStore(server.URL), 24*time.Hour, false, 0)
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, event := range []string{"message_created", "message_outgoing"} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			env := validEnvelope()
+			env.Event = event
+			errs <- core.HandleChatwootWebhook(context.Background(), env)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			require.ErrorIs(t, err, ErrInProgress)
+		}
+	}
+	assert.Equal(t, int32(1), calls.Load())
+}
+
+func TestHandleChatwootWebhookFazerAIEventPreservesSafetyFilters(t *testing.T) {
+	for _, mutate := range []func(*chatwoot.WebhookEnvelope){
+		func(env *chatwoot.WebhookEnvelope) { env.MessageType = "incoming" },
+		func(env *chatwoot.WebhookEnvelope) { env.Private = true },
+	} {
+		env := validEnvelope()
+		env.Event = "message_outgoing"
+		mutate(&env)
+		err := New(newMemoryBridgeStore("http://unused.invalid"), 24*time.Hour, false, 0).HandleChatwootWebhook(context.Background(), env)
+		require.ErrorIs(t, err, ErrSkipped)
+	}
+}
+
+func TestHandleChatwootWebhookRejectsMissingMessageID(t *testing.T) {
+	env := validEnvelope()
+	env.Event = "message_outgoing"
+	env.ID = 0
+	err := New(newMemoryBridgeStore("http://unused.invalid"), 24*time.Hour, false, 0).HandleChatwootWebhook(context.Background(), env)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid Chatwoot message id")
+}
+
+func TestHandleChatwootWebhookSkipsUnrelatedEvent(t *testing.T) {
+	st := newMemoryBridgeStore("http://unused.invalid")
+	env := validEnvelope()
+	env.Event = "conversation_updated"
+	err := New(st, 24*time.Hour, false, 0).HandleChatwootWebhook(context.Background(), env)
+	require.ErrorIs(t, err, ErrSkipped)
+	assert.Empty(t, st.claims)
+	assert.Empty(t, st.audits)
+}
+
 func TestHandleChatwootWebhookRetriesAfterTransientFailure(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
