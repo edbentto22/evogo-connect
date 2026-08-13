@@ -33,7 +33,7 @@ type MessagesUpsertData struct {
 func (e WebhookEnvelope) IncomingText() (MessagesUpsertData, string, bool, error) {
 	var zero MessagesUpsertData
 	event := strings.ToUpper(strings.TrimSpace(e.Event))
-	if event != "MESSAGES_UPSERT" && event != "MESSAGE" {
+	if event != "MESSAGES_UPSERT" && event != "MESSAGES.UPSERT" && event != "MESSAGE" {
 		return zero, "unsupported_event", false, nil
 	}
 	if len(e.Data) == 0 || string(e.Data) == "null" {

@@ -64,6 +64,24 @@ func TestWebhookEnvelopeIncomingTextContract(t *testing.T) {
 	assert.Equal(t, "olá", content)
 }
 
+func TestWebhookEnvelopeIncomingTextAcceptsEvolutionDotEvent(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"messages.upsert","instance":"demo","data":{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":false,"id":"ABC-dot"},"message":{"conversation":"olá"},"messageType":"conversation"}}`), &env))
+	message, content, accepted, err := env.IncomingText()
+	require.NoError(t, err)
+	assert.True(t, accepted)
+	assert.Equal(t, "ABC-dot", message.Key.ID)
+	assert.Equal(t, "olá", content)
+}
+
+func TestWebhookEnvelopeIncomingTextRejectsUnsupportedEventPunctuation(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"messages---upsert","data":{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":false,"id":"ABC"},"message":{"conversation":"olá"},"messageType":"conversation"}}`), &env))
+	_, _, accepted, err := env.IncomingText()
+	require.NoError(t, err)
+	assert.False(t, accepted)
+}
+
 func TestWebhookEnvelopeIncomingTextSupportsExtendedTextAndSkipsBroadcasts(t *testing.T) {
 	var env WebhookEnvelope
 	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"key":{"remoteJid":"5511@s.whatsapp.net","id":"x"},"message":{"extendedTextMessage":{"text":"oi"}},"messageType":"extendedTextMessage"}}`), &env))
