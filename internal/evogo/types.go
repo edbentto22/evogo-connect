@@ -31,31 +31,42 @@ type MessagesUpsertData struct {
 // Evolution Go pode nomear o evento em maiúsculas ou minúsculas; o formato de
 // dados é o mesmo, conforme o contrato whatsmeow/Fazer.ai homologado.
 func (e WebhookEnvelope) IncomingText() (MessagesUpsertData, string, bool, error) {
+	data, content, _, accepted, err := e.IncomingTextWithReason()
+	return data, content, accepted, err
+}
+
+// IncomingTextWithReason devolve um motivo técnico fixo quando o webhook não
+// deve ser encaminhado. O motivo nunca contém conteúdo, JID ou outro dado do
+// payload e pode ser usado com segurança em logs e métricas.
+func (e WebhookEnvelope) IncomingTextWithReason() (MessagesUpsertData, string, string, bool, error) {
 	var zero MessagesUpsertData
 	event := strings.ToUpper(strings.TrimSpace(e.Event))
 	if event != "MESSAGES_UPSERT" && event != "MESSAGES.UPSERT" && event != "MESSAGE" {
-		return zero, "unsupported_event", false, nil
+		return zero, "", "unsupported_event", false, nil
 	}
 	if len(e.Data) == 0 || string(e.Data) == "null" {
-		return zero, "invalid_payload", false, fmt.Errorf("evogo: webhook data is required")
+		return zero, "", "invalid_payload", false, fmt.Errorf("evogo: webhook data is required")
 	}
 	var data MessagesUpsertData
 	if err := json.Unmarshal(e.Data, &data); err != nil {
-		return zero, "invalid_payload", false, fmt.Errorf("evogo: decode message data: %w", err)
+		return zero, "", "invalid_payload", false, fmt.Errorf("evogo: decode message data: %w", err)
 	}
 	jid := strings.ToLower(strings.TrimSpace(data.Key.RemoteJID))
-	if data.Key.FromMe || strings.HasSuffix(jid, "@g.us") || strings.HasSuffix(jid, "@broadcast") || strings.HasSuffix(jid, "@newsletter") {
-		return data, "unsupported_message", false, nil
+	if data.Key.FromMe {
+		return data, "", "own_message", false, nil
+	}
+	if strings.HasSuffix(jid, "@g.us") || strings.HasSuffix(jid, "@broadcast") || strings.HasSuffix(jid, "@newsletter") {
+		return data, "", "non_direct_message", false, nil
 	}
 	content, messageIsText := incomingMessageText(data.Message)
 	messageType := strings.ToLower(strings.TrimSpace(data.MessageType))
 	if !messageIsText || strings.TrimSpace(content) == "" || (messageType != "conversation" && messageType != "extendedtextmessage") {
-		return data, "unsupported_message", false, nil
+		return data, "", "unsupported_message_type", false, nil
 	}
 	if strings.TrimSpace(data.Key.ID) == "" || strings.TrimSpace(data.Key.RemoteJID) == "" {
-		return zero, "invalid_payload", false, fmt.Errorf("evogo: message key is required")
+		return zero, "", "invalid_payload", false, fmt.Errorf("evogo: message key is required")
 	}
-	return data, content, true, nil
+	return data, content, "", true, nil
 }
 
 func incomingMessageText(message map[string]any) (string, bool) {

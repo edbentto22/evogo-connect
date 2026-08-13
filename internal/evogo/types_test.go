@@ -82,6 +82,18 @@ func TestWebhookEnvelopeIncomingTextRejectsUnsupportedEventPunctuation(t *testin
 	assert.False(t, accepted)
 }
 
+func TestWebhookEnvelopeIncomingTextReasonNeverContainsContent(t *testing.T) {
+	const secretContent = "conteudo-que-nao-pode-ir-ao-log"
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":false,"id":"ABC"},"message":{"conversation":"`+secretContent+`"},"messageType":"imageMessage"}}`), &env))
+	_, content, reason, accepted, err := env.IncomingTextWithReason()
+	require.NoError(t, err)
+	assert.False(t, accepted)
+	assert.Empty(t, content)
+	assert.Equal(t, "unsupported_message_type", reason)
+	assert.NotContains(t, reason, secretContent)
+}
+
 func TestWebhookEnvelopeIncomingTextSupportsExtendedTextAndSkipsBroadcasts(t *testing.T) {
 	var env WebhookEnvelope
 	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"key":{"remoteJid":"5511@s.whatsapp.net","id":"x"},"message":{"extendedTextMessage":{"text":"oi"}},"messageType":"extendedTextMessage"}}`), &env))

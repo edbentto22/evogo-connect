@@ -319,13 +319,17 @@ func (c *Core) HandleEvogoWebhook(ctx context.Context, tenant *store.Tenant, env
 		return ErrPaused
 	}
 
-	message, content, process, err := env.IncomingText()
+	message, content, skipReason, process, err := env.IncomingTextWithReason()
 	if err != nil {
 		metrics.BridgeErrors.WithLabelValues("invalid_evo_payload", "bridge").Inc()
 		return fmt.Errorf("bridge: validate Evolution Go webhook: %w", err)
 	}
 	if !process {
 		metrics.BridgeMessages.WithLabelValues(string(DirW2C), "skipped_event").Inc()
+		slog.Info("bridge: w2c skipped",
+			"tenant", tenant.Name,
+			"reason", skipReason,
+		)
 		return ErrSkipped
 	}
 	jid, _, err := evogo.ParseDirectJID(message.Key.RemoteJID)
