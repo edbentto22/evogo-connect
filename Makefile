@@ -1,4 +1,4 @@
-.PHONY: help build run test vet fmt tidy migrate-up migrate-down clean docker-build docker-run
+.PHONY: help build run test vet fmt tidy migrate-up migrate-down clean docker-build docker-run docker-down validate-coolify
 
 GO          ?= go
 BIN_DIR     ?= bin
@@ -45,6 +45,9 @@ docker-run: ## Sobe stack completa (Postgres + connector)
 
 docker-down: ## Derruba stack
 	docker compose -f deploy/docker-compose.yml down
+
+validate-coolify: ## Valida o compose de produção para Coolify
+	bash scripts/validate-coolify-compose.sh
 
 clean: ## Limpa artefatos
 	rm -rf $(BIN_DIR) coverage.out coverage.html

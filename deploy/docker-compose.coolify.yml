@@ -1,0 +1,73 @@
+services:
+  connector:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://connect:${SERVICE_PASSWORD_64_POSTGRES}@postgres:5432/evogo_connect?sslmode=disable
+      CONNECT_MASTER_KEY: ${SERVICE_REALBASE64_32_CONNECTOR}
+      ADMIN_TOKEN: ${SERVICE_HEX_64_CONNECTOR_ADMIN}
+      # Credenciais opcionais e temporárias usadas apenas pelo `connect setup`.
+      # O Coolify as exibe na UI porque estão declaradas no compose; remova os
+      # valores e faça redeploy depois que a CLI cifrá-las no Postgres.
+      CHATWOOT_TOKEN: ${CHATWOOT_TOKEN:-}
+      EVO_INSTANCE_TOKEN: ${EVO_INSTANCE_TOKEN:-}
+      SERVER_ADDR: :9090
+      LOG_LEVEL: info
+      LOG_FORMAT: json
+      # Seguro por padrão: após provisionar, altere BRIDGE_PAUSED para false e
+      # faça redeploy somente quando estiver pronto para o smoke real.
+      BRIDGE_PAUSED: ${BRIDGE_PAUSED:-true}
+      RATE_LIMIT_PER_MINUTE: "120"
+      IDEMPOTENCY_TTL: 24h
+      HMAC_REPLAY_WINDOW: 5m
+    expose:
+      - "9090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/evogo-connect", "--healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    stop_grace_period: 35s
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: evogo_connect
+      POSTGRES_USER: connect
+      POSTGRES_PASSWORD: ${SERVICE_PASSWORD_64_POSTGRES}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+volumes:
+  postgres_data:

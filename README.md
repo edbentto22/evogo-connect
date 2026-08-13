@@ -21,13 +21,17 @@ etapas).
   Chatwoot é enviada ao WhatsApp, com idempotência atômica, audit log e HMAC.
 - ✅ Contratos automatizados homologados para **Evolution Go 0.7.2** e
   **Chatwoot 4.16.2**.
+- ✅ Pacote de deploy candidato a produção para **Coolify**, com Postgres
+  privado, segredos persistentes e healthchecks.
 - ⏳ Forward bridge (WhatsApp → Chatwoot) — Etapa 2.
-- ⏳ Stack final de produção para Coolify e smoke E2E em VPS — próxima etapa.
+- ⏳ Smoke E2E em VPS com instâncias reais — gate antes de liberar tráfego.
 - ⏳ Mídia rica, status updates, grupos — Etapas 5-7.
 
-O código da Etapa 1 possui testes de contrato, retry e concorrência. Antes de
-liberar uma VPS para tráfego real, execute `scripts/smoke-e2e.sh` contra as
-instâncias que serão usadas; o compose atual ainda é uma referência local.
+O código da Etapa 1 possui testes de contrato, retry e concorrência. Para
+produção, use `deploy/docker-compose.coolify.yml` e siga `docs/coolify.md`.
+Antes de liberar uma VPS para tráfego real, execute `scripts/smoke-e2e.sh`
+contra as instâncias que serão usadas. O compose `deploy/docker-compose.yml`
+permanece uma referência local.
 
 Ver `.context/plans/2026-08-12-evogo-chatwoot-connector.md` para o roadmap
 completo e `.context/research/` para a investigação.
@@ -72,12 +76,11 @@ make build
 ./bin/evogo-connect
 
 # 7. Em outro terminal, provisionar a primeira inbox
+# Defina CHATWOOT_TOKEN e EVO_INSTANCE_TOKEN no ambiente deste terminal.
 ./bin/connect setup --name demo \
   --chatwoot-url https://chatwoot.example.com \
-  --chatwoot-token <api_access_token> \
   --chatwoot-account 1 \
   --evo-url http://localhost:8080 \
-  --evo-key <TOKEN_DA_INSTANCIA> \
   --evo-instance demo \
   --connect-url http://localhost:9090
 
@@ -133,7 +136,8 @@ Modelo completo em `docs/security.md`.
 
 ## Operações
 
-Ver `docs/operations.md` — health, métricas, troubleshooting, upgrade.
+Ver `docs/coolify.md` para deploy de produção e `docs/operations.md` para
+health, métricas e troubleshooting.
 
 ## License
 

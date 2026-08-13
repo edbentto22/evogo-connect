@@ -30,10 +30,8 @@ TENANT="smoke-$(date +%s)"
 ./bin/connect setup \
   --name "$TENANT" \
   --chatwoot-url "$CHATWOOT_URL" \
-  --chatwoot-token "$CHATWOOT_TOKEN" \
   --chatwoot-account "$CHATWOOT_ACCOUNT" \
   --evo-url "$EVO_URL" \
-  --evo-key "$EVO_INSTANCE_TOKEN" \
   --evo-instance "$EVO_INSTANCE" \
   --connect-url "$CONNECT_URL"
 

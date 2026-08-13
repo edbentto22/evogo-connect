@@ -1,5 +1,9 @@
 # Operations runbook — evogo-connect
 
+Para produção no Coolify, os comandos de deploy, backup e restore estão em
+[coolify.md](coolify.md). O compose `deploy/docker-compose.yml` e os exemplos
+com `localhost` desta página são destinados ao ambiente local.
+
 ## Health checks
 
 | Endpoint | Verifica | Códigos |
@@ -107,12 +111,12 @@ em background (Etapa 6).
 ### "Como adicionar mais um número (nova inbox)?"
 
 ```bash
+CHATWOOT_TOKEN="$CW_TOKEN" \
+EVO_INSTANCE_TOKEN="$EVO_INSTANCE_TOKEN" \
 connect setup --name loja2 \
   --chatwoot-url https://cw.example.com \
-  --chatwoot-token $CW_TOKEN \
   --chatwoot-account 1 \
   --evo-url http://localhost:8080 \
-  --evo-key $EVO_INSTANCE_TOKEN \
   --evo-instance loja2 \
   --connect-url https://evogo-connect.example.com
 
@@ -125,6 +129,10 @@ connect add-contact --tenant loja2 \
 
 Crítico: tabela `tenants` (contém chaves cifradas). Sem ela, não é possível
 recriar o bridge. Recomenda-se backup diário do Postgres com retenção de 30d.
+O backup só é restaurável com a mesma `CONNECT_MASTER_KEY`; guarde a chave
+separadamente em um cofre. Em Coolify, siga o procedimento de
+[backup e restore](coolify.md#5-backup-e-restore), pois o banco não publica
+porta no host.
 
 ```bash
 # Backup
@@ -136,11 +144,11 @@ pg_restore -d evogo_connect backup-2026-08-12.dump
 
 ## Upgrade
 
-Tenants criados por versões anteriores guardavam `hmac_token` e a chave global
-do Evolution Go. Depois de subir a nova imagem, execute novamente `connect
-setup` com o **mesmo `--name`**, o token individual da instância e as
-credenciais atuais do Chatwoot. O comando atualiza o tenant e reutiliza a inbox,
-sem perder contatos nem IDs locais.
+Em produção, faça backup, preserve o volume e as magic variables e use o
+redeploy do Coolify conforme [o guia de upgrade](coolify.md#6-upgrade-e-redeploy).
+As migrations rodam automaticamente na inicialização.
+
+Os comandos abaixo servem somente ao compose local:
 
 ```bash
 # 1. Puxar imagem nova

@@ -91,13 +91,14 @@ curl -s http://localhost:9090/metrics | head -5   # métricas Prometheus
 >   onde o Chatwoot vai mandar webhooks)
 
 ```bash
+# CW_TOKEN e EVO_INSTANCE_TOKEN devem ser exportados de forma segura.
+CHATWOOT_TOKEN="$CW_TOKEN" \
+EVO_INSTANCE_TOKEN="$EVO_INSTANCE_TOKEN" \
 ./bin/connect setup \
   --name demo \
   --chatwoot-url https://chatwoot.empresa.com \
-  --chatwoot-token "$CW_TOKEN" \
   --chatwoot-account 1 \
   --evo-url http://localhost:8080 \
-  --evo-key "$EVO_INSTANCE_TOKEN" \
   --evo-instance demo \
   --connect-url https://evogo.empresa.com
 ```
@@ -228,81 +229,30 @@ psql postgres://connect:connect@localhost:5432/evogo_connect \
 
 ---
 
-## 6. Deploy de referência
+## 6. Deploy de produção no Coolify
 
-O compose em `deploy/` é adequado para desenvolvimento e homologação. O
-pacote final para Coolify, com segredos, healthcheck e exposição de portas
-endurecidos, pertence à próxima etapa e deve ser concluído antes da VPS de
-produção receber tráfego real.
+Use exclusivamente `deploy/docker-compose.coolify.yml` para produção no
+Coolify compatível (requisito mínimo `v4.0.0-beta.411`). O pacote contém apenas o conector e um PostgreSQL
+privado e persistente; TLS e domínio pertencem ao proxy do Coolify. O compose
+local `deploy/docker-compose.yml` mantém Caddy e portas de desenvolvimento e
+não deve ser usado como modelo de produção.
 
-### 6.1. Stack completa (docker-compose)
+Resumo:
 
-```bash
-# No servidor:
-git clone https://github.com/edbentto22/evogo-connect.git
-cd evogo-connect
+1. Importe o repositório como recurso Docker Compose.
+2. Selecione `deploy/docker-compose.coolify.yml`.
+3. Associe `https://evogo.empresa.com:9090` ao serviço `connector`.
+4. Mantenha segredos somente runtime, desative build args e aguarde os serviços ficarem healthy.
+5. Abra o terminal do `connector` e execute `/app/connect setup`.
+6. Faça backup das magic variables e do banco.
+7. Execute o smoke real antes de liberar tráfego.
 
-cp deploy/.env.example .env
-# Editar .env com chaves reais
-echo "CONNECT_MASTER_KEY=$(openssl rand -base64 32)" >> .env
-echo "ADMIN_TOKEN=$(openssl rand -hex 32)" >> .env
+O Coolify gera as senhas, a chave AES-256 e o token administrativo pelas magic
+environment variables do compose. Não regenere esses valores em redeploys. Em
+especial, perder a chave mestra torna os tokens cifrados irrecuperáveis.
 
-# Subir o ambiente de homologação
-docker compose -f deploy/docker-compose.yml up -d
-
-# Verificar
-curl -s https://evogo.empresa.com/readyz
-```
-
-O compose sobe:
-- **postgres** (porta 5432, volume persistente)
-- **caddy** (porta 8080, proxy reverso com TLS)
-- **connector** (porta interna 9090, atrás do Caddy)
-
-### 6.2. Configurar domínio + TLS
-
-Edite `deploy/Caddyfile` e troque `:8080` pelo seu domínio:
-
-```caddyfile
-evogo.empresa.com {
-    reverse_proxy connector:9090
-    encode gzip zstd
-    log
-}
-```
-
-Caddy gera TLS automático via Let's Encrypt se o domínio apontar pro
-servidor. Pra dev local, mantenha `:8080`.
-
-### 6.3. Backup
-
-```bash
-# Diário
-pg_dump -Fc evogo_connect > backup-$(date +%F).dump
-
-# Restore
-pg_restore -d evogo_connect backup-2026-08-13.dump
-```
-
-Crítico: a tabela `tenants` (contém chaves cifradas). Sem ela, todo o
-bridge precisa ser reprovisionado.
-
-### 6.4. Upgrade
-
-```bash
-docker compose -f deploy/docker-compose.yml pull
-docker compose -f deploy/docker-compose.yml up -d
-# Migrations rodam automaticamente na inicialização.
-
-# Obrigatório ao migrar tenants criados por versões anteriores: o mesmo nome
-# atualiza o secret da inbox e troca a chave global pelo token da instância.
-./bin/connect setup --name demo \
-  --chatwoot-url https://chatwoot.empresa.com \
-  --chatwoot-token "$CW_TOKEN" --chatwoot-account 1 \
-  --evo-url http://localhost:8080 \
-  --evo-key "$EVO_INSTANCE_TOKEN" --evo-instance demo \
-  --connect-url https://evogo.empresa.com
-```
+O procedimento completo de DNS, provisionamento, backup/restore, upgrade e
+troubleshooting está em [Deploy de produção no Coolify](coolify.md).
 
 ---
 
@@ -395,12 +345,12 @@ Recomendado: pg_cron para automatizar (Etapa 6).
 
 ```bash
 # Repita o setup com outro nome
+CHATWOOT_TOKEN="$CW_TOKEN" \
+EVO_INSTANCE_TOKEN="$EVO_INSTANCE_TOKEN" \
 ./bin/connect setup --name loja2 \
   --chatwoot-url https://chatwoot.empresa.com \
-  --chatwoot-token "$CW_TOKEN" \
   --chatwoot-account 1 \
   --evo-url http://localhost:8080 \
-  --evo-key "$EVO_INSTANCE_TOKEN" \
   --evo-instance loja2 \
   --connect-url https://evogo.empresa.com
 

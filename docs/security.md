@@ -27,7 +27,10 @@ SELECT pg_typeof(chatwoot_token_enc) FROM tenants;
 ```
 
 A chave mestra é carregada uma vez na inicialização; não há API pra
-exportá-la. Em produção, montar via Docker secret / Vault.
+exportá-la. Em plataformas com suporte do aplicativo, prefira Docker secret ou
+Vault. O pacote Coolify atual usa variável marcada **somente runtime**, com
+injeção de build args desabilitada, porque o binário ainda lê configuração por
+env.
 
 ## 3. PII em logs
 
@@ -89,9 +92,11 @@ Acima disso → 400 Bad Request antes de processar.
 ## 9. TLS na borda
 
 O connector escuta em **HTTP puro** (assume TLS terminado no proxy).
-Em produção: **sempre** usar Caddy/Traefik/ALB com TLS válido.
+Em produção no Coolify, **sempre** associar um domínio HTTPS ao serviço
+`connector` na porta interna `9090`; o proxy gerenciado pelo Coolify termina o
+TLS. Não inclua Caddy ou Traefik no compose de produção.
 
-Configuração Caddy de exemplo em `deploy/Caddyfile`.
+O Caddy em `deploy/Caddyfile` existe somente para desenvolvimento local.
 
 ## 10. Timeouts
 
@@ -104,12 +109,14 @@ Configuração Caddy de exemplo em `deploy/Caddyfile`.
 
 Antes de subir pra produção, validar:
 
-- [ ] `CONNECT_MASTER_KEY` gerado (`openssl rand -base64 32`)
-- [ ] `ADMIN_TOKEN` gerado (`openssl rand -hex 32`) e NUNCA em git
-- [ ] Postgres com TLS (`sslmode=require` ou `verify-full`)
-- [ ] TLS válido no Caddy/Traefik (Let's Encrypt via domínio real)
-- [ ] `BRIDGE_PAUSED=false` confirmado
+- [ ] Magic variables do Coolify geradas, persistidas e copiadas para um cofre
+- [ ] `Inject Build Args to Dockerfile` desativado e segredos somente runtime
+- [ ] `CONNECT_MASTER_KEY` original incluída no plano de disaster recovery
+- [ ] Postgres sem porta publicada e isolado na rede interna do stack
+- [ ] TLS válido no proxy do Coolify e domínio apontando para a porta interna 9090
+- [ ] Primeiro deploy com `BRIDGE_PAUSED=true`; `false` somente durante o smoke/liberação
 - [ ] Backups do Postgres configurados
+- [ ] Restore testado com um backup e a chave mestra original
 - [ ] Métricas Prometheus scrapeando `/metrics`
 - [ ] Audit log acessível apenas para admin
 - [ ] Sem PII em logs (rodar `grep` em busca de telefone em produção)
