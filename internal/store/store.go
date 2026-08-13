@@ -324,7 +324,7 @@ const (
 func (s *Store) ClaimIdempotency(ctx context.Context, direction, key string, tenantID uuid.UUID, ttl time.Duration, claimToken string) (IdempotencyClaim, error) {
 	row := s.pool.QueryRow(ctx, `
 		INSERT INTO idempotency (key, direction, tenant_id, status, detail, expires_at)
-		VALUES ($1,$2,$3,'processing',jsonb_build_object('claim_token',$5), now() + $4::interval)
+		VALUES ($1,$2,$3,'processing',jsonb_build_object('claim_token',$5::text), now() + $4::interval)
 		ON CONFLICT (direction, key) DO UPDATE SET
 			tenant_id = EXCLUDED.tenant_id,
 			status = 'processing',
