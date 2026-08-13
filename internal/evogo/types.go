@@ -58,10 +58,12 @@ func (e WebhookEnvelope) IncomingTextWithReason() (MessagesUpsertData, string, s
 	if strings.HasSuffix(jid, "@g.us") || strings.HasSuffix(jid, "@broadcast") || strings.HasSuffix(jid, "@newsletter") {
 		return data, "", "non_direct_message", false, nil
 	}
+	// A estrutura da mensagem é o contrato confiável: alguns builds da
+	// Evolution Go variam o rótulo messageType, mas preservam conversation ou
+	// extendedTextMessage.text para textos diretos.
 	content, messageIsText := incomingMessageText(data.Message)
-	messageType := strings.ToLower(strings.TrimSpace(data.MessageType))
-	if !messageIsText || strings.TrimSpace(content) == "" || (messageType != "conversation" && messageType != "extendedtextmessage") {
-		return data, "", "unsupported_message_type", false, nil
+	if !messageIsText || strings.TrimSpace(content) == "" {
+		return data, "", "unsupported_message_structure", false, nil
 	}
 	if strings.TrimSpace(data.Key.ID) == "" || strings.TrimSpace(data.Key.RemoteJID) == "" {
 		return zero, "", "invalid_payload", false, fmt.Errorf("evogo: message key is required")
@@ -71,7 +73,9 @@ func (e WebhookEnvelope) IncomingTextWithReason() (MessagesUpsertData, string, s
 
 func incomingMessageText(message map[string]any) (string, bool) {
 	if content, ok := message["conversation"].(string); ok {
-		return content, true
+		if strings.TrimSpace(content) != "" {
+			return content, true
+		}
 	}
 	extended, ok := message["extendedTextMessage"].(map[string]any)
 	if !ok {

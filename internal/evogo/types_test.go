@@ -82,16 +82,45 @@ func TestWebhookEnvelopeIncomingTextRejectsUnsupportedEventPunctuation(t *testin
 	assert.False(t, accepted)
 }
 
-func TestWebhookEnvelopeIncomingTextReasonNeverContainsContent(t *testing.T) {
-	const secretContent = "conteudo-que-nao-pode-ir-ao-log"
+func TestWebhookEnvelopeIncomingTextAcceptsTextDespiteMessageTypeDrift(t *testing.T) {
+	const text = "texto-de-cliente"
 	var env WebhookEnvelope
-	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":false,"id":"ABC"},"message":{"conversation":"`+secretContent+`"},"messageType":"imageMessage"}}`), &env))
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":false,"id":"ABC"},"message":{"conversation":"`+text+`"},"messageType":"unexpected-build-label"}}`), &env))
+	_, content, reason, accepted, err := env.IncomingTextWithReason()
+	require.NoError(t, err)
+	assert.True(t, accepted)
+	assert.Equal(t, text, content)
+	assert.Empty(t, reason)
+}
+
+func TestWebhookEnvelopeIncomingTextAcceptsTextWithoutMessageType(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"messages.upsert","data":{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":false,"id":"ABC"},"message":{"conversation":"olá"}}}`), &env))
+	_, content, accepted, err := env.IncomingText()
+	require.NoError(t, err)
+	assert.True(t, accepted)
+	assert.Equal(t, "olá", content)
+}
+
+func TestWebhookEnvelopeIncomingTextFallsBackFromEmptyConversation(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":false,"id":"ABC"},"message":{"conversation":" ","extendedTextMessage":{"text":"olá"}}}}`), &env))
+	_, content, accepted, err := env.IncomingText()
+	require.NoError(t, err)
+	assert.True(t, accepted)
+	assert.Equal(t, "olá", content)
+}
+
+func TestWebhookEnvelopeIncomingTextReasonNeverContainsContent(t *testing.T) {
+	const privateContent = "conteudo-que-nao-pode-ir-ao-log"
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":false,"id":"ABC"},"message":{"imageMessage":{"caption":"`+privateContent+`"}}}}`), &env))
 	_, content, reason, accepted, err := env.IncomingTextWithReason()
 	require.NoError(t, err)
 	assert.False(t, accepted)
 	assert.Empty(t, content)
-	assert.Equal(t, "unsupported_message_type", reason)
-	assert.NotContains(t, reason, secretContent)
+	assert.Equal(t, "unsupported_message_structure", reason)
+	assert.NotContains(t, reason, privateContent)
 }
 
 func TestWebhookEnvelopeIncomingTextSupportsExtendedTextAndSkipsBroadcasts(t *testing.T) {
