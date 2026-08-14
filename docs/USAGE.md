@@ -126,6 +126,15 @@ O que aconteceu:
    formato de chave `data.key` quanto o formato nativo `data.info` documentado
    pela Evolution Go. Não copie a URL para logs, tickets ou chats.
 
+### Sincronização de mensagens manuais
+
+Mensagens de texto diretas enviadas pelo aplicativo WhatsApp do número
+conectado também aparecem na conversa correspondente como mensagens de saída
+do Chatwoot. O conector ignora grupos, listas de transmissão, status,
+newsletters e mídia. Uma mensagem enviada pelo próprio Chatwoot não volta para
+a conversa como cópia, e a mensagem criada pelo conector no Chatwoot não é
+reenviada ao WhatsApp.
+
 ---
 
 ## 4. Adicionar contatos

@@ -51,6 +51,15 @@ func (s *webhookTestStore) ClaimIdempotency(context.Context, string, string, uui
 func (s *webhookTestStore) CompleteDelivery(context.Context, string, string, string, []byte, time.Duration, store.BridgeLogEntry) error {
 	return nil
 }
+func (s *webhookTestStore) CompleteManualOutgoing(context.Context, string, string, string, []byte, string, string, string, []byte, time.Duration, store.BridgeLogEntry, store.BridgeLogEntry) error {
+	return nil
+}
+func (s *webhookTestStore) MarkC2WOrigin(context.Context, string, string, string, string, time.Duration) error {
+	return nil
+}
+func (s *webhookTestStore) HasCompletedC2WMessage(context.Context, uuid.UUID, string) (bool, error) {
+	return false, nil
+}
 func (s *webhookTestStore) ReleaseIdempotency(context.Context, string, string, string) error {
 	return nil
 }

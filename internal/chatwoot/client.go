@@ -205,6 +205,22 @@ func (c *Client) CreateIncomingMessage(ctx context.Context, conversationID int64
 	return nil
 }
 
+// CreateOutgoingMessage posta uma mensagem pública outgoing e devolve seu ID
+// estável no Chatwoot. O bridge usa esse ID para suprimir o webhook de retorno
+// que, de outro modo, reenviaria uma mensagem manual ao WhatsApp.
+func (c *Client) CreateOutgoingMessage(ctx context.Context, conversationID int64, content, contentType string) (int64, error) {
+	payload := MessageCreatePayload{Content: content, MessageType: "outgoing", Private: false, ContentType: contentType}
+	var out MessageResponse
+	path := fmt.Sprintf("/api/v1/accounts/%d/conversations/%d/messages", c.accountID, conversationID)
+	if err := c.do(ctx, http.MethodPost, path, payload, &out); err != nil {
+		return 0, fmt.Errorf("chatwoot: create outgoing message: %w", err)
+	}
+	if out.ID <= 0 {
+		return 0, errors.New("chatwoot: create outgoing message returned no id")
+	}
+	return out.ID, nil
+}
+
 // EnsureContactConversation cria ou reutiliza o contato, o vínculo da inbox e
 // a conversa de API. O identifier é sempre o JID normalizado pelo bridge.
 func (c *Client) EnsureContactConversation(ctx context.Context, name, jid string, inboxID int) (*ContactResponse, *ConversationResponse, error) {

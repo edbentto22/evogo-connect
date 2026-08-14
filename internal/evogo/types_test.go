@@ -123,6 +123,18 @@ func TestWebhookEnvelopeIncomingTextSkipsOwnEvolutionGoInfoMessage(t *testing.T)
 	assert.Equal(t, "own_message", reason)
 }
 
+func TestWebhookEnvelopeDirectTextAcceptsOwnDirectMessage(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":true,"id":"OWN-1"},"message":{"conversation":"mensagem manual"}}}`), &env))
+	message, content, own, reason, accepted, err := env.DirectTextWithReason()
+	require.NoError(t, err)
+	assert.True(t, accepted)
+	assert.True(t, own)
+	assert.Empty(t, reason)
+	assert.Equal(t, "OWN-1", message.Key.ID)
+	assert.Equal(t, "mensagem manual", content)
+}
+
 func TestWebhookEnvelopeIncomingTextNeverForwardsOwnHybridMessage(t *testing.T) {
 	var env WebhookEnvelope
 	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":false,"id":"HYBRID"},"info":{"isFromMe":true},"message":{"conversation":"não encaminhar"}}}`), &env))

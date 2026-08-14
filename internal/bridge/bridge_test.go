@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -26,6 +27,7 @@ type memoryBridgeStore struct {
 	tenant   *store.Tenant
 	claims   map[string]string
 	tokens   map[string]string
+	details  map[string][]byte
 	audits   []store.BridgeLogEntry
 	paused   bool
 	claimErr error
@@ -40,8 +42,9 @@ func newMemoryBridgeStore(evoURL string) *memoryBridgeStore {
 			EvoBaseURL:      evoURL,
 			EvoAPIKey:       "instance-token",
 		},
-		claims: make(map[string]string),
-		tokens: make(map[string]string),
+		claims:  make(map[string]string),
+		tokens:  make(map[string]string),
+		details: make(map[string][]byte),
 	}
 }
 
@@ -79,15 +82,61 @@ func (s *memoryBridgeStore) ClaimIdempotency(_ context.Context, direction, key s
 	return store.ClaimAcquired, nil
 }
 
-func (s *memoryBridgeStore) CompleteDelivery(_ context.Context, direction, key, claimToken string, _ []byte, _ time.Duration, entry store.BridgeLogEntry) error {
+func (s *memoryBridgeStore) CompleteDelivery(_ context.Context, direction, key, claimToken string, detail []byte, _ time.Duration, entry store.BridgeLogEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.tokens[direction+":"+key] != claimToken {
 		return errors.New("claim token mismatch")
 	}
 	s.claims[direction+":"+key] = "sent"
+	s.details[direction+":"+key] = append([]byte(nil), detail...)
 	s.audits = append(s.audits, entry)
 	return nil
+}
+
+func (s *memoryBridgeStore) CompleteManualOutgoing(_ context.Context, w2cDirection, w2cKey, w2cClaimToken string, w2cDetail []byte, c2wDirection, c2wKey, c2wClaimToken string, c2wDetail []byte, _ time.Duration, w2cEntry, c2wEntry store.BridgeLogEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.tokens[w2cDirection+":"+w2cKey] != w2cClaimToken || s.tokens[c2wDirection+":"+c2wKey] != c2wClaimToken {
+		return errors.New("claim token mismatch")
+	}
+	s.claims[w2cDirection+":"+w2cKey] = "sent"
+	s.details[w2cDirection+":"+w2cKey] = append([]byte(nil), w2cDetail...)
+	s.claims[c2wDirection+":"+c2wKey] = "sent"
+	s.details[c2wDirection+":"+c2wKey] = append([]byte(nil), c2wDetail...)
+	s.audits = append(s.audits, w2cEntry, c2wEntry)
+	return nil
+}
+
+func (s *memoryBridgeStore) MarkC2WOrigin(_ context.Context, direction, key, claimToken, evolutionMessageID string, _ time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	mapKey := direction + ":" + key
+	if s.tokens[mapKey] != claimToken || s.claims[mapKey] != "processing" {
+		return errors.New("claim token mismatch")
+	}
+	s.details[mapKey] = []byte(`{"evo_message_id":"` + evolutionMessageID + `"}`)
+	return nil
+}
+
+func (s *memoryBridgeStore) HasCompletedC2WMessage(_ context.Context, tenantID uuid.UUID, evolutionMessageID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for mapKey, status := range s.claims {
+		if !strings.HasPrefix(mapKey, string(DirC2W)+":") || status != "sent" {
+			continue
+		}
+		var detail struct {
+			EvolutionMessageID string `json:"evo_message_id"`
+		}
+		if err := json.Unmarshal(s.details[mapKey], &detail); err != nil {
+			continue
+		}
+		if detail.EvolutionMessageID == evolutionMessageID && tenantID == s.tenant.ID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (s *memoryBridgeStore) ReleaseIdempotency(_ context.Context, direction, key, claimToken string) error {
@@ -194,11 +243,104 @@ func TestHandleEvogoWebhookPublishesIncomingExactlyOnce(t *testing.T) {
 	assert.Equal(t, "w2c", st.audits[0].Direction)
 }
 
-func TestHandleEvogoWebhookSkipsOwnGroupsAndMedia(t *testing.T) {
+func TestHandleEvogoWebhookPublishesOwnManualMessageAndSuppressesItsWebhook(t *testing.T) {
+	var outgoingCalls, evoCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/accounts/1/contacts/search":
+			_, _ = w.Write([]byte(`{"payload":[{"id":44,"identifier":"5511999999999@s.whatsapp.net","contact_inboxes":[{"id":3,"source_id":"5511999999999@s.whatsapp.net","inbox":{"id":7}}]}]}`))
+		case "/api/v1/accounts/1/conversations":
+			_, _ = w.Write([]byte(`{"data":[{"id":91,"inbox_id":7,"status":"open"}]}`))
+		case "/api/v1/accounts/1/conversations/91/messages":
+			var payload chatwoot.MessageCreatePayload
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+			assert.Equal(t, "outgoing", payload.MessageType)
+			outgoingCalls.Add(1)
+			_, _ = w.Write([]byte(`{"id":778}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	evo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		evoCalls.Add(1)
+		_, _ = w.Write([]byte(`{"status":"sent"}`))
+	}))
+	defer evo.Close()
+
+	st := newMemoryBridgeStore(evo.URL)
+	st.tenant.ChatwootBaseURL = server.URL
+	st.tenant.ChatwootAccountID = 1
+	st.tenant.ChatwootToken = "cw-token"
+	core := New(st, time.Hour, false, 0)
+	manual := evogo.WebhookEnvelope{Event: "MESSAGE", Data: json.RawMessage(`{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":true,"id":"MANUAL-1"},"message":{"conversation":"mensagem manual"}}`)}
+	require.NoError(t, core.HandleEvogoWebhook(context.Background(), st.tenant, manual))
+	require.NoError(t, core.HandleEvogoWebhook(context.Background(), st.tenant, manual))
+	assert.Equal(t, int32(1), outgoingCalls.Load())
+	assert.Equal(t, "sent", st.claims["w2c-own:w2c:demo:MANUAL-1"])
+	assert.Equal(t, "sent", st.claims["c2w:c2w:demo:778"])
+
+	chatwootEcho := validEnvelope()
+	chatwootEcho.ID = 778
+	chatwootEcho.Content = "mensagem manual"
+	require.NoError(t, core.HandleChatwootWebhook(context.Background(), chatwootEcho))
+	assert.Equal(t, int32(0), evoCalls.Load())
+}
+
+func TestHandleEvogoWebhookSkipsOwnMessageOriginallySentByChatwoot(t *testing.T) {
+	st := newMemoryBridgeStore("http://unused.invalid")
+	core := New(st, time.Hour, false, 0)
+	chatwootMessageID := int64(700)
+	evolutionMessageID := deterministicMessageID(st.tenant.ID, chatwootMessageID)
+	key := "c2w:demo:700"
+	claimState, err := st.ClaimIdempotency(context.Background(), string(DirC2W), key, st.tenant.ID, time.Minute, "c2w-claim")
+	require.NoError(t, err)
+	require.Equal(t, store.ClaimAcquired, claimState)
+	detail := []byte(`{"evo_message_id":"` + evolutionMessageID + `"}`)
+	require.NoError(t, st.CompleteDelivery(context.Background(), string(DirC2W), key, "c2w-claim", detail, time.Hour, store.BridgeLogEntry{}))
+
+	err = core.HandleEvogoWebhook(context.Background(), st.tenant, evogo.WebhookEnvelope{Event: "MESSAGE", Data: json.RawMessage(`{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":true,"id":"` + evolutionMessageID + `"},"message":{"conversation":"não duplicar"}}`)})
+	require.ErrorIs(t, err, ErrSkipped)
+	assert.Empty(t, st.claims["w2c:w2c:demo:"+evolutionMessageID])
+}
+
+func TestHandleEvogoWebhookReleasesOwnClaimAfterChatwootFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/accounts/1/contacts/search":
+			_, _ = w.Write([]byte(`{"payload":[{"id":44,"identifier":"5511999999999@s.whatsapp.net","contact_inboxes":[{"id":3,"source_id":"5511999999999@s.whatsapp.net","inbox":{"id":7}}]}]}`))
+		case "/api/v1/accounts/1/conversations":
+			_, _ = w.Write([]byte(`{"data":[{"id":91,"inbox_id":7,"status":"open"}]}`))
+		case "/api/v1/accounts/1/conversations/91/messages":
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	st := newMemoryBridgeStore("http://unused.invalid")
+	st.tenant.ChatwootBaseURL = server.URL
+	st.tenant.ChatwootAccountID = 1
+	st.tenant.ChatwootToken = "cw-token"
+	err := New(st, time.Hour, false, 0).HandleEvogoWebhook(context.Background(), st.tenant, evogo.WebhookEnvelope{Event: "MESSAGE", Data: json.RawMessage(`{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":true,"id":"MANUAL-FAILED"},"message":{"conversation":"tentar de novo"}}`)})
+	require.Error(t, err)
+	assert.Equal(t, "failed", st.claims["w2c-own:w2c:demo:MANUAL-FAILED"])
+}
+
+func TestHandleEvogoWebhookAuditsOwnMessageWithoutID(t *testing.T) {
+	st := newMemoryBridgeStore("http://unused.invalid")
+	err := New(st, time.Hour, false, 0).HandleEvogoWebhook(context.Background(), st.tenant, evogo.WebhookEnvelope{Event: "MESSAGE", Data: json.RawMessage(`{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":true},"message":{"conversation":"sem identificador"}}`)})
+	require.Error(t, err)
+	require.Len(t, st.audits, 1)
+	assert.Equal(t, "invalid_evo_payload", st.audits[0].ErrorCode)
+	assert.Empty(t, st.audits[0].ExternalMessageID)
+}
+
+func TestHandleEvogoWebhookSkipsGroupsAndMedia(t *testing.T) {
 	st := newMemoryBridgeStore("http://unused.invalid")
 	core := New(st, time.Hour, false, 0)
 	for _, data := range []string{
-		`{"key":{"remoteJid":"5511@s.whatsapp.net","fromMe":true,"id":"1"},"message":{"conversation":"x"},"messageType":"conversation"}`,
 		`{"key":{"remoteJid":"123@g.us","fromMe":false,"id":"2"},"message":{"conversation":"x"},"messageType":"conversation"}`,
 		`{"key":{"remoteJid":"5511@s.whatsapp.net","fromMe":false,"id":"3"},"message":{"imageMessage":{}},"messageType":"imageMessage"}`,
 	} {

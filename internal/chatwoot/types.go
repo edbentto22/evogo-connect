@@ -240,10 +240,17 @@ func (r *ConversationListResponse) UnmarshalJSON(data []byte) error {
 
 // ─── Create message (POST /api/v1/accounts/{account_id}/conversations/{cid}/messages) ───
 
-// MessageCreatePayload é o body para criar mensagem (incoming de cliente).
+// MessageCreatePayload é o body para criar mensagem pública em uma conversa.
 type MessageCreatePayload struct {
 	Content     string `json:"content"`
 	MessageType string `json:"message_type"` // "incoming" | "outgoing"
 	Private     bool   `json:"private"`
 	ContentType string `json:"content_type,omitempty"`
+}
+
+// MessageResponse contém a identificação estável retornada ao criar uma
+// mensagem. Ela é necessária para suprimir o webhook Chatwoot → WhatsApp da
+// própria mensagem criada pelo conector.
+type MessageResponse struct {
+	ID int64 `json:"id"`
 }

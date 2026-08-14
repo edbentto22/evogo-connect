@@ -49,37 +49,49 @@ func (e WebhookEnvelope) IncomingText() (MessagesUpsertData, string, bool, error
 // deve ser encaminhado. O motivo nunca contém conteúdo, JID ou outro dado do
 // payload e pode ser usado com segurança em logs e métricas.
 func (e WebhookEnvelope) IncomingTextWithReason() (MessagesUpsertData, string, string, bool, error) {
+	data, content, own, reason, accepted, err := e.DirectTextWithReason()
+	if err != nil || !accepted {
+		return data, content, reason, accepted, err
+	}
+	if own {
+		return data, "", "own_message", false, nil
+	}
+	return data, content, "", true, nil
+}
+
+// DirectTextWithReason extrai um texto direto, independentemente de ele ter
+// sido enviado pelo número conectado ou recebido por ele. O booleano own só é
+// verdadeiro quando o payload identifica explicitamente uma mensagem própria.
+// Chamadores que só aceitam mensagens de clientes devem usar IncomingText.
+func (e WebhookEnvelope) DirectTextWithReason() (MessagesUpsertData, string, bool, string, bool, error) {
 	var zero MessagesUpsertData
 	event := strings.ToUpper(strings.TrimSpace(e.Event))
 	if event != "MESSAGES_UPSERT" && event != "MESSAGES.UPSERT" && event != "MESSAGE" {
-		return zero, "", "unsupported_event", false, nil
+		return zero, "", false, "unsupported_event", false, nil
 	}
 	if len(e.Data) == 0 || string(e.Data) == "null" {
-		return zero, "", "invalid_payload", false, fmt.Errorf("evogo: webhook data is required")
+		return zero, "", false, "invalid_payload", false, fmt.Errorf("evogo: webhook data is required")
 	}
 	var data MessagesUpsertData
 	if err := json.Unmarshal(e.Data, &data); err != nil {
-		return zero, "", "invalid_payload", false, fmt.Errorf("evogo: decode message data: %w", err)
+		return zero, "", false, "invalid_payload", false, fmt.Errorf("evogo: decode message data: %w", err)
 	}
 	normalizeMessageInfo(&data)
 	jid := strings.ToLower(strings.TrimSpace(data.Key.RemoteJID))
-	if data.isFromMe() {
-		return data, "", "own_message", false, nil
-	}
 	if strings.HasSuffix(jid, "@g.us") || strings.HasSuffix(jid, "@broadcast") || strings.HasSuffix(jid, "@newsletter") {
-		return data, "", "non_direct_message", false, nil
+		return data, "", false, "non_direct_message", false, nil
 	}
 	// A estrutura da mensagem é o contrato confiável: alguns builds da
 	// Evolution Go variam o rótulo messageType, mas preservam conversation ou
 	// extendedTextMessage.text para textos diretos.
 	content, messageIsText := incomingMessageText(data.Message)
 	if !messageIsText || strings.TrimSpace(content) == "" {
-		return data, "", "unsupported_message_structure", false, nil
+		return data, "", false, "unsupported_message_structure", false, nil
 	}
 	if strings.TrimSpace(data.Key.ID) == "" || strings.TrimSpace(data.Key.RemoteJID) == "" {
-		return zero, "", "invalid_payload", false, fmt.Errorf("evogo: message key is required (%s)", webhookDataShape(e.Data))
+		return zero, "", false, "invalid_payload", false, fmt.Errorf("evogo: message key is required (%s)", webhookDataShape(e.Data))
 	}
-	return data, content, "", true, nil
+	return data, content, data.IsFromMe(), "", true, nil
 }
 
 // normalizeMessageInfo adapta o payload nativo do Evolution Go (info) para o
@@ -97,9 +109,9 @@ func normalizeMessageInfo(data *MessagesUpsertData) {
 	}
 }
 
-// isFromMe é deliberadamente conservador: se qualquer contrato disponível
+// IsFromMe é deliberadamente conservador: se qualquer contrato disponível
 // identificar a mensagem como própria, ela jamais é encaminhada ao Chatwoot.
-func (data MessagesUpsertData) isFromMe() bool {
+func (data MessagesUpsertData) IsFromMe() bool {
 	return data.Key.FromMe != nil && *data.Key.FromMe || data.Info.IsFromMe != nil && *data.Info.IsFromMe
 }
 

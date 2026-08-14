@@ -94,12 +94,18 @@ processamento retornam erro reenviável, não um falso 200.
 
 1. Evolution Go envia o evento de mensagem (`MESSAGE` ou `MESSAGES_UPSERT`) para a URL exclusiva da instância.
 2. O conector valida o segredo no caminho em tempo constante e limita o body.
-3. Aceita apenas texto direto recebido (`fromMe=false` ou `info.isFromMe=false`);
-   os formatos `key` e `info` da Evolution Go são normalizados. Grupos, mídia
-   e eventos desconhecidos retornam 200 sem efeito.
-4. O core cria/reutiliza contato e vínculo da inbox, publica uma mensagem
-   `incoming`, registra o mapeamento e conclui a idempotência/auditoria.
-5. Falhas conhecidas do Chatwoot retornam 503 e liberam retry; timeout de rede
+3. Aceita texto direto recebido (`fromMe=false` ou `info.isFromMe=false`) e
+   texto direto enviado manualmente pelo número conectado. Os formatos `key`
+   e `info` da Evolution Go são normalizados. Grupos, mídia e eventos
+   desconhecidos retornam 200 sem efeito.
+4. O core cria/reutiliza contato e vínculo da inbox, publica mensagens de
+   cliente como `incoming` e mensagens manuais do número conectado como
+   `outgoing`, registra o mapeamento e conclui a idempotência/auditoria.
+5. Mensagens que saíram do Chatwoot são reconhecidas pelo ID determinístico
+   enviado à Evolution Go. Mensagens `outgoing` criadas pelo conector recebem
+   uma supressão persistente antes que seu webhook volte ao WhatsApp; assim o
+   fluxo não cria loops.
+6. Falhas conhecidas do Chatwoot retornam 503 e liberam retry; timeout de rede
    mantém o claim para reduzir risco de duplicação.
 
 ## Modelo de dados (Postgres)

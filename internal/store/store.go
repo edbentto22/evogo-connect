@@ -410,6 +410,99 @@ func (s *Store) CompleteDelivery(ctx context.Context, direction, key, claimToken
 	return nil
 }
 
+// CompleteManualOutgoing conclui atomically a entrega WhatsApp → Chatwoot e
+// a supressão do webhook Chatwoot → WhatsApp gerado por essa mesma publicação.
+// As duas chaves já precisam ter sido adquiridas; não há mudança de schema.
+func (s *Store) CompleteManualOutgoing(ctx context.Context, w2cDirection, w2cKey, w2cClaimToken string, w2cDetail []byte, c2wDirection, c2wKey, c2wClaimToken string, c2wDetail []byte, ttl time.Duration, w2cEntry, c2wEntry BridgeLogEntry) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("store: begin manual outgoing completion: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	for _, completion := range []struct {
+		direction  string
+		key        string
+		claimToken string
+		detail     []byte
+	}{
+		{w2cDirection, w2cKey, w2cClaimToken, w2cDetail},
+		{c2wDirection, c2wKey, c2wClaimToken, c2wDetail},
+	} {
+		tag, err := tx.Exec(ctx, `
+			UPDATE idempotency
+			SET status = 'sent', detail = $3, expires_at = now() + $4::interval
+			WHERE direction = $1 AND key = $2 AND status = 'processing'
+			  AND detail->>'claim_token' = $5
+		`, completion.direction, completion.key, completion.detail, ttl.String(), completion.claimToken)
+		if err != nil {
+			return fmt.Errorf("store: complete manual outgoing idempotency: %w", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return errors.New("store: complete manual outgoing: active claim not found")
+		}
+	}
+
+	for _, entry := range []BridgeLogEntry{w2cEntry, c2wEntry} {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO bridge_log (tenant_id, direction, external_message_id, jid,
+			                       payload_sha256, status, error_code, error_detail, latency_ms)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		`, entry.TenantID, entry.Direction, entry.ExternalMessageID, entry.JID,
+			entry.PayloadSHA256, entry.Status, nullIfEmpty(entry.ErrorCode), nullIfEmpty(entry.ErrorDetail), entry.LatencyMS)
+		if err != nil {
+			return fmt.Errorf("store: insert manual outgoing audit: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("store: commit manual outgoing completion: %w", err)
+	}
+	return nil
+}
+
+// MarkC2WOrigin grava o ID determinístico antes da chamada remota. Assim um
+// webhook próprio que chegue antes do sucesso do envio ainda é identificado
+// como origem Chatwoot e não se transforma em mensagem manual.
+func (s *Store) MarkC2WOrigin(ctx context.Context, direction, key, claimToken, evolutionMessageID string, ttl time.Duration) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE idempotency
+		SET detail = jsonb_build_object('claim_token', $4::text, 'evo_message_id', $5::text),
+		    expires_at = now() + $6::interval
+		WHERE direction = $1 AND key = $2 AND status = 'processing'
+		  AND detail->>'claim_token' = $3
+	`, direction, key, claimToken, claimToken, evolutionMessageID, ttl.String())
+	if err != nil {
+		return fmt.Errorf("store: mark c2w origin: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return errors.New("store: mark c2w origin: active claim not found")
+	}
+	return nil
+}
+
+// HasCompletedC2WMessage informa se um ID determinístico enviado à Evolution
+// Go pertence a uma entrega Chatwoot → WhatsApp já concluída. O lookup é exato
+// e limitado ao tenant para que uma mensagem manual nunca seja descartada só
+// por compartilhar um prefixo com IDs internos.
+func (s *Store) HasCompletedC2WMessage(ctx context.Context, tenantID uuid.UUID, evolutionMessageID string) (bool, error) {
+	var found bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM idempotency
+			WHERE direction = 'c2w'
+			  AND tenant_id = $1
+			  AND status IN ('processing', 'sent')
+			  AND expires_at > now()
+			  AND detail->>'evo_message_id' = $2
+		)
+	`, tenantID, evolutionMessageID).Scan(&found)
+	if err != nil {
+		return false, fmt.Errorf("store: find completed c2w message: %w", err)
+	}
+	return found, nil
+}
+
 // ReleaseIdempotency torna uma tentativa falha imediatamente reenviável.
 func (s *Store) ReleaseIdempotency(ctx context.Context, direction, key, claimToken string) error {
 	tag, err := s.pool.Exec(ctx, `

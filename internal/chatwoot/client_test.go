@@ -219,3 +219,21 @@ func TestFindOpenConversationAcceptsFazerAIPayloadAndPaginates(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 3, conversation.ID)
 }
+
+func TestCreateOutgoingMessageUsesPublicOutgoingContract(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "/api/v1/accounts/1/conversations/91/messages", r.URL.Path)
+		var payload MessageCreatePayload
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+		assert.Equal(t, "outgoing", payload.MessageType)
+		assert.False(t, payload.Private)
+		assert.Equal(t, "texto manual", payload.Content)
+		_, _ = w.Write([]byte(`{"id":1234}`))
+	}))
+	defer server.Close()
+
+	id, err := NewClient(server.URL, 1, "token").CreateOutgoingMessage(context.Background(), 91, "texto manual", "text")
+	require.NoError(t, err)
+	assert.Equal(t, int64(1234), id)
+}
