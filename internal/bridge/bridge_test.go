@@ -274,7 +274,9 @@ func TestHandleEvogoWebhookPublishesOwnManualMessageAndSuppressesItsWebhook(t *t
 	st.tenant.ChatwootAccountID = 1
 	st.tenant.ChatwootToken = "cw-token"
 	core := New(st, time.Hour, false, 0)
-	manual := evogo.WebhookEnvelope{Event: "MESSAGE", Data: json.RawMessage(`{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":true,"id":"MANUAL-1"},"message":{"conversation":"mensagem manual"}}`)}
+	// A Evolution Go pode publicar a conversa de uma mensagem própria em LID.
+	// O destinatário direto vem em recipientAlt e deve chegar ao Chatwoot.
+	manual := evogo.WebhookEnvelope{Event: "MESSAGE", Data: json.RawMessage(`{"info":{"id":"MANUAL-1","chat":{"user":"123456789","server":"lid"},"sender":{"user":"5511888888888","server":"s.whatsapp.net"},"recipientAlt":{"user":"5511999999999","server":"s.whatsapp.net"},"isFromMe":true},"message":{"conversation":"mensagem manual"}}`)}
 	require.NoError(t, core.HandleEvogoWebhook(context.Background(), st.tenant, manual))
 	require.NoError(t, core.HandleEvogoWebhook(context.Background(), st.tenant, manual))
 	assert.Equal(t, int32(1), outgoingCalls.Load())

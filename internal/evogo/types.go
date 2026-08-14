@@ -14,6 +14,20 @@ type WebhookEnvelope struct {
 	Data     json.RawMessage `json:"data"`
 }
 
+// MessageInfo representa o contrato nativo whatsmeow serializado pela
+// Evolution Go em data.info.
+type MessageInfo struct {
+	ID     string          `json:"id"`
+	Chat   json.RawMessage `json:"chat"`
+	Sender json.RawMessage `json:"sender"`
+	// RecipientAlt e SenderAlt são os JIDs WhatsApp diretos alternativos
+	// emitidos quando Chat ou Sender usa o domínio LID.
+	RecipientAlt json.RawMessage `json:"recipientAlt"`
+	SenderAlt    json.RawMessage `json:"senderAlt"`
+	IsFromMe     *bool           `json:"isFromMe"`
+	PushName     string          `json:"pushName"`
+}
+
 // MessagesUpsertData representa dados de uma mensagem recebida.
 type MessagesUpsertData struct {
 	Key struct {
@@ -28,13 +42,7 @@ type MessagesUpsertData struct {
 	// Info é o formato emitido por versões recentes do Evolution Go, baseado
 	// diretamente em whatsmeow. Ele é mantido ao lado de Key para preservar a
 	// compatibilidade com os dois contratos de webhook.
-	Info struct {
-		ID       string          `json:"id"`
-		Chat     json.RawMessage `json:"chat"`
-		Sender   json.RawMessage `json:"sender"`
-		IsFromMe *bool           `json:"isFromMe"`
-		PushName string          `json:"pushName"`
-	} `json:"info"`
+	Info MessageInfo `json:"info"`
 }
 
 // IncomingText extrai somente o contrato seguro de mensagem direta em texto.
@@ -95,14 +103,15 @@ func (e WebhookEnvelope) DirectTextWithReason() (MessagesUpsertData, string, boo
 }
 
 // normalizeMessageInfo adapta o payload nativo do Evolution Go (info) para o
-// contrato interno usado pelo bridge. A chave legada tem precedência quando
-// estiver completa.
+// contrato interno usado pelo bridge. Um JID direto da chave legada tem
+// precedência; um LID da chave ainda precisa do candidato direto alternativo.
 func normalizeMessageInfo(data *MessagesUpsertData) {
 	if strings.TrimSpace(data.Key.ID) == "" {
 		data.Key.ID = data.Info.ID
 	}
-	if strings.TrimSpace(data.Key.RemoteJID) == "" {
-		data.Key.RemoteJID = selectInfoJID(data.Info.Chat, data.Info.Sender)
+	currentJID := strings.TrimSpace(data.Key.RemoteJID)
+	if currentJID == "" || isLIDJID(currentJID) {
+		data.Key.RemoteJID = selectInfoJID(data.Info, data.IsFromMe())
 	}
 	if strings.TrimSpace(data.PushName) == "" {
 		data.PushName = data.Info.PushName
@@ -115,23 +124,35 @@ func (data MessagesUpsertData) IsFromMe() bool {
 	return data.Key.FromMe != nil && *data.Key.FromMe || data.Info.IsFromMe != nil && *data.Info.IsFromMe
 }
 
-func selectInfoJID(chatRaw, senderRaw json.RawMessage) string {
-	chat := webhookJID(chatRaw)
-	if isNonDirectJID(chat) || isDirectJID(chat) {
+// selectInfoJID escolhe somente candidatos seguros para o sentido declarado
+// da mensagem. Uma conversa de grupo em Chat sempre prevalece sobre campos
+// alternativos, para que nunca seja transformada em conversa direta.
+func selectInfoJID(info MessageInfo, own bool) string {
+	chat := webhookJID(info.Chat)
+	if isNonDirectJID(chat) {
 		return chat
 	}
-	sender := webhookJID(senderRaw)
-	if isDirectJID(sender) {
-		return sender
+	if own {
+		return firstDirectJID(chat, webhookJID(info.RecipientAlt))
 	}
-	if chat != "" {
-		return chat
+	return firstDirectJID(webhookJID(info.Sender), webhookJID(info.SenderAlt), chat)
+}
+
+func firstDirectJID(candidates ...string) string {
+	for _, candidate := range candidates {
+		if isDirectJID(candidate) {
+			return candidate
+		}
 	}
-	return sender
+	return ""
 }
 
 func isDirectJID(jid string) bool {
 	return strings.HasSuffix(strings.ToLower(strings.TrimSpace(jid)), "@s.whatsapp.net")
+}
+
+func isLIDJID(jid string) bool {
+	return strings.HasSuffix(strings.ToLower(strings.TrimSpace(jid)), "@lid")
 }
 
 func isNonDirectJID(jid string) bool {

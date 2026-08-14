@@ -153,6 +153,64 @@ func TestWebhookEnvelopeIncomingTextUsesDirectSenderWhenInfoChatIsLID(t *testing
 	assert.Equal(t, "5511999999999@s.whatsapp.net", message.Key.RemoteJID)
 }
 
+func TestWebhookEnvelopeDirectTextUsesRecipientAltForOwnLIDMessage(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"info":{"id":"OWN-ALT","chat":{"user":"123456789","server":"lid"},"sender":{"user":"5511888888888","server":"s.whatsapp.net"},"recipientAlt":{"user":"5511999999999","server":"s.whatsapp.net"},"isFromMe":true},"message":{"conversation":"texto manual"}}}`), &env))
+	message, _, own, reason, accepted, err := env.DirectTextWithReason()
+	require.NoError(t, err)
+	assert.True(t, accepted)
+	assert.True(t, own)
+	assert.Empty(t, reason)
+	assert.Equal(t, "5511999999999@s.whatsapp.net", message.Key.RemoteJID)
+}
+
+func TestWebhookEnvelopeIncomingTextUsesSenderAltForLIDMessage(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"info":{"id":"IN-ALT","chat":{"user":"123456789","server":"lid"},"sender":{"user":"987654321","server":"lid"},"senderAlt":{"user":"5511999999999","server":"s.whatsapp.net"},"isFromMe":false},"message":{"conversation":"texto recebido"}}}`), &env))
+	message, content, accepted, err := env.IncomingText()
+	require.NoError(t, err)
+	assert.True(t, accepted)
+	assert.Equal(t, "texto recebido", content)
+	assert.Equal(t, "5511999999999@s.whatsapp.net", message.Key.RemoteJID)
+}
+
+func TestWebhookEnvelopeDirectTextKeepsGroupWhenAlternateDirectJIDExists(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"info":{"id":"GROUP-ALT","chat":{"user":"123","server":"g.us"},"recipientAlt":{"user":"5511999999999","server":"s.whatsapp.net"},"isFromMe":true},"message":{"conversation":"não encaminhar"}}}`), &env))
+	_, _, _, reason, accepted, err := env.DirectTextWithReason()
+	require.NoError(t, err)
+	assert.False(t, accepted)
+	assert.Equal(t, "non_direct_message", reason)
+}
+
+func TestWebhookEnvelopeDirectTextKeepsCanonicalKeyBeforeAlternates(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"key":{"remoteJid":"5511777777777@s.whatsapp.net","fromMe":true,"id":"KEY-FIRST"},"info":{"chat":{"user":"123456789","server":"lid"},"recipientAlt":{"user":"5511999999999","server":"s.whatsapp.net"}},"message":{"conversation":"texto"}}}`), &env))
+	message, _, own, _, accepted, err := env.DirectTextWithReason()
+	require.NoError(t, err)
+	assert.True(t, accepted)
+	assert.True(t, own)
+	assert.Equal(t, "5511777777777@s.whatsapp.net", message.Key.RemoteJID)
+}
+
+func TestWebhookEnvelopeDirectTextResolvesLIDKeyWithRecipientAlt(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"key":{"remoteJid":"123456789@lid","fromMe":true,"id":"KEY-LID"},"info":{"chat":{"user":"123456789","server":"lid"},"recipientAlt":{"user":"5511999999999","server":"s.whatsapp.net"}},"message":{"conversation":"texto"}}}`), &env))
+	message, _, own, _, accepted, err := env.DirectTextWithReason()
+	require.NoError(t, err)
+	assert.True(t, accepted)
+	assert.True(t, own)
+	assert.Equal(t, "5511999999999@s.whatsapp.net", message.Key.RemoteJID)
+}
+
+func TestWebhookEnvelopeDirectTextRejectsLIDWithoutDirectAlternative(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"info":{"id":"LID-ONLY","chat":{"user":"123456789","server":"lid"},"sender":{"user":"987654321","server":"lid"},"isFromMe":false},"message":{"conversation":"texto"}}}`), &env))
+	_, _, _, _, _, err := env.DirectTextWithReason()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "message key is required")
+}
+
 func TestWebhookEnvelopeIncomingTextFallsBackFromEmptyConversation(t *testing.T) {
 	var env WebhookEnvelope
 	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":false,"id":"ABC"},"message":{"conversation":" ","extendedTextMessage":{"text":"olá"}}}}`), &env))

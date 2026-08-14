@@ -124,7 +124,9 @@ O que aconteceu:
    caminho e assinatura apenas da categoria `MESSAGE` (o evento recebido pode
    ser chamado de `MESSAGE` ou `MESSAGES_UPSERT`). O conector aceita tanto o
    formato de chave `data.key` quanto o formato nativo `data.info` documentado
-   pela Evolution Go. Não copie a URL para logs, tickets ou chats.
+   pela Evolution Go. Se este último usar um LID interno, o conector usa apenas
+   `senderAlt` ou `recipientAlt` que sejam JIDs diretos válidos. Não copie a
+   URL para logs, tickets ou chats.
 
 ### Sincronização de mensagens manuais
 
@@ -390,8 +392,9 @@ tenants em paralelo (multi-empresa).
 
 ## 9. Limites atuais
 
-- **Texto direto** — ambos os sentidos funcionam. Mensagens de grupo, próprias,
-  mídia e status recebidos da Evolution Go são ignorados nesta versão.
+- **Texto direto** — ambos os sentidos funcionam, inclusive mensagens diretas
+  enviadas manualmente pelo número conectado. Mensagens de grupo, mídia e
+  status recebidos da Evolution Go são ignorados nesta versão.
 - **Mídia:** só o primeiro anexo da mensagem é enviado (Etapa 5 amplia pra
   múltiplos anexos + transcrição de áudio).
 - **Contactos:** mensagens recebidas criam o contato e vínculo automaticamente.

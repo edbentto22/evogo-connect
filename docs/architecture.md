@@ -96,8 +96,9 @@ processamento retornam erro reenviável, não um falso 200.
 2. O conector valida o segredo no caminho em tempo constante e limita o body.
 3. Aceita texto direto recebido (`fromMe=false` ou `info.isFromMe=false`) e
    texto direto enviado manualmente pelo número conectado. Os formatos `key`
-   e `info` da Evolution Go são normalizados. Grupos, mídia e eventos
-   desconhecidos retornam 200 sem efeito.
+   e `info` da Evolution Go são normalizados; quando o formato nativo usa um
+   LID, `senderAlt` (entrada) ou `recipientAlt` (saída manual) fornece o JID
+   direto. Grupos, mídia e eventos desconhecidos retornam 200 sem efeito.
 4. O core cria/reutiliza contato e vínculo da inbox, publica mensagens de
    cliente como `incoming` e mensagens manuais do número conectado como
    `outgoing`, registra o mapeamento e conclui a idempotência/auditoria.
