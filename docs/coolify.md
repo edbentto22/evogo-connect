@@ -21,13 +21,24 @@ continua sendo apenas uma referência de desenvolvimento.
    Variable** para todos eles.
 6. Confirme `BRIDGE_PAUSED=true` e faça o primeiro deploy.
 
+Esse compose é específico para a execução do Coolify, que usa a raiz clonada
+como `--project-directory`. Para validá-lo fora da plataforma, execute
+`make validate-coolify`; não use diretamente `docker compose -f` sem informar a
+raiz do projeto.
+
 O Coolify gera e preserva automaticamente:
 
 | Magic variable | Uso |
 |---|---|
 | `SERVICE_PASSWORD_64_POSTGRES` | senha interna do PostgreSQL e DSN do conector |
 | `SERVICE_REALBASE64_32_CONNECTOR` | `CONNECT_MASTER_KEY`, chave AES-256 dos tokens persistidos |
-| `SERVICE_HEX_64_CONNECTOR_ADMIN` | `ADMIN_TOKEN` dos endpoints administrativos |
+| `SERVICE_HEX_64_ADMIN` | `ADMIN_TOKEN` dos endpoints administrativos |
+
+Se estiver atualizando um recurso que já possua um valor **não vazio** em
+`SERVICE_HEX_64_CONNECTOR_ADMIN`, copie esse mesmo valor para
+`SERVICE_HEX_64_ADMIN` antes do redeploy e remova a variável antiga somente
+depois de validar os endpoints administrativos. No primeiro deploy que falhou
+com `ADMIN_TOKEN not set`, não há token anterior válido a preservar.
 
 Não substitua nem regenere esses valores em redeploys. Guarde uma cópia segura
 dos três para disaster recovery. A `SERVICE_REALBASE64_32_CONNECTOR` é
@@ -98,6 +109,19 @@ Ainda no terminal, adicione os contatos necessários durante a Etapa 1:
 /app/connect status
 ```
 
+Para criar uma conversa diretamente na inbox e no contato já configurados, sem
+expor o token do Chatwoot no terminal, use:
+
+```bash
+/app/connect start-conversation \
+  --tenant demo \
+  --jid 5511999999999@s.whatsapp.net
+```
+
+O comando confere o vínculo atual do contato antes de abrir a conversa. Depois,
+envie a resposta nessa conversa recém-aberta; ele não corrige mensagens que já
+tenham sido enviadas em uma conversa antiga com vínculo incorreto.
+
 Se o provisionamento externo falhar, corrija a credencial ou conectividade e
 repita `setup` com o mesmo `--name`. Não apague o volume para tentar corrigir
 uma falha de Chatwoot ou Evolution Go.
@@ -120,7 +144,21 @@ Antes de liberar tráfego real:
 7. Execute `scripts/smoke-e2e.sh` de uma estação autorizada, com as
    credenciais das instâncias homologadas.
 
-O fluxo WhatsApp → Chatwoot ainda não existe nesta etapa.
+7. Envie um texto do WhatsApp pareado para a instância. Ele deve aparecer como
+   mensagem recebida na inbox correspondente do Chatwoot; os logs mostram
+   `bridge: w2c delivered` sem exibir conteúdo ou telefone completo.
+
+O `connect setup` configura automaticamente uma URL de webhook exclusiva por
+instância na Evolution Go. O segredo fica cifrado no Postgres e não aparece em
+`connect status` nem nos logs do conector. Não configure um webhook global ou
+uma URL manual na Evolution Go. Para rotacionar o segredo, execute novamente
+`connect setup` com o mesmo `--name` e `--rotate-evo-webhook-secret`; limite o
+acesso aos logs do proxy/Coolify, pois o caminho completo da URL pode aparecer
+nos registros.
+
+Após atualizar para esta versão, execute `connect setup` novamente para cada
+tenant existente (mesmo `--name` e credenciais temporárias). Isso grava o
+segredo cifrado e registra o webhook Evolution Go; não recria a inbox.
 
 ## 5. Backup e restore
 

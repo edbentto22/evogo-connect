@@ -66,15 +66,27 @@ type Core struct {
 	// sync.Map porque o padrão de uso é read-heavy (cada webhook lê o limiter
 	// do seu tenant) e write-rare (só na primeira request do tenant).
 	limiters sync.Map
+
+	manualOutgoingMu sync.Mutex
+	manualOutgoing   map[string]*pendingManualOutgoing
+}
+
+type pendingManualOutgoing struct {
+	done  chan struct{}
+	count int
 }
 
 // BridgeStore contém apenas as operações persistentes usadas pelo core.
 type BridgeStore interface {
 	IsPaused(context.Context) (bool, error)
 	GetTenantByChatwootInbox(context.Context, int) (*store.Tenant, error)
+	CreateContact(context.Context, *store.ContactMap) error
 	ClaimIdempotency(context.Context, string, string, uuid.UUID, time.Duration, string) (store.IdempotencyClaim, error)
 	CompleteDelivery(context.Context, string, string, string, []byte, time.Duration, store.BridgeLogEntry) error
+	CompleteManualOutgoing(context.Context, string, string, string, []byte, string, string, string, []byte, time.Duration, store.BridgeLogEntry, store.BridgeLogEntry) error
+	MarkC2WOrigin(context.Context, string, string, string, string, time.Duration) error
 	ReleaseIdempotency(context.Context, string, string, string) error
+	HasCompletedC2WMessage(context.Context, uuid.UUID, string) (bool, error)
 	LogBridge(context.Context, store.BridgeLogEntry) error
 }
 
@@ -122,12 +134,13 @@ func (c *Core) IsPaused(ctx context.Context) (bool, error) {
 
 // ─── Etapa 1: Chatwoot → WhatsApp (reverse) ─────────────────────────────
 
-// HandleChatwootWebhook processa um webhook do Chatwoot (MessageCreated de
-// outgoing). Retorna ErrSkipped/ErrPaused/ErrRateLimited para casos não-erro.
+// HandleChatwootWebhook processa um webhook de mensagem outgoing do Chatwoot.
+// Além de message_created, aceita message_outgoing, evento adicional emitido
+// pelo fork fazer.ai com o mesmo message.webhook_data.
 //
 // Fluxo:
 //  1. Verifica kill switch
-//  2. Filtra: só processa message_created + outgoing + !private
+//  2. Filtra: só processa eventos de mensagem criada/saída + outgoing + !private
 //  3. Resolve tenant pelo inbox_id
 //  4. Resolve JID via contact_inbox.source_id
 //  5. Adquire claim idempotente por chatwoot_message_id
@@ -154,8 +167,8 @@ func (c *Core) HandleChatwootWebhook(ctx context.Context, env chatwoot.WebhookEn
 	}
 
 	// 2. Filtro de evento
-	if env.Event != "message_created" {
-		metrics.BridgeMessages.WithLabelValues(string(DirC2W), "skipped_event").Inc()
+	if env.Event != "message_created" && env.Event != "message_outgoing" {
+		metrics.BridgeMessages.WithLabelValues(string(DirC2W), skippedEventStatus(env.Event)).Inc()
 		return fmt.Errorf("%w: event=%s", ErrSkipped, env.Event)
 	}
 	if env.MessageType != "outgoing" {
@@ -165,6 +178,10 @@ func (c *Core) HandleChatwootWebhook(ctx context.Context, env chatwoot.WebhookEn
 	if env.Private {
 		metrics.BridgeMessages.WithLabelValues(string(DirC2W), "skipped_private").Inc()
 		return fmt.Errorf("%w: private note", ErrSkipped)
+	}
+	if env.ID <= 0 {
+		metrics.BridgeErrors.WithLabelValues("invalid_message_id", "bridge").Inc()
+		return fmt.Errorf("bridge: invalid Chatwoot message id %d", env.ID)
 	}
 
 	// 3. Resolve tenant
@@ -178,12 +195,28 @@ func (c *Core) HandleChatwootWebhook(ctx context.Context, env chatwoot.WebhookEn
 	}
 	log = log.With("tenant", tenant.Name)
 
-	// 4. Resolve JID via contact_inbox.source_id
-	jid, number, jidErr := evogo.ParseDirectJID(env.Conversation.ContactInbox.SourceID)
+	// 4. Resolve JID via contact_inbox.source_id. O Fazer.ai pode serializar
+	// esse objeto sem source_id em webhooks de mensagens outgoing, mas mantém
+	// o identifier do mesmo contato em conversation.meta.sender.
+	sourceID := strings.TrimSpace(env.Conversation.ContactInbox.SourceID)
+	sourceField := "contact_inbox.source_id"
+	if sourceID == "" {
+		sourceID = env.Conversation.Meta.Sender.Identifier
+		sourceField = "conversation.meta.sender.identifier"
+		log.Info("bridge: using Chatwoot contact identifier fallback")
+	}
+	jid, number, jidErr := evogo.ParseDirectJID(sourceID)
 	if jidErr != nil {
-		metrics.BridgeErrors.WithLabelValues("empty_source_id", "bridge").Inc()
-		auditErr := c.logAudit(ctx, tenant.ID, DirC2W, fmt.Sprintf("%d", env.ID), "", nil, "error", "invalid_source_id", "source_id inválido", 0)
-		return errors.Join(fmt.Errorf("bridge: validate source_id: %w", jidErr), auditErr)
+		errCode := "invalid_source_id"
+		if sourceField == "conversation.meta.sender.identifier" {
+			errCode = "invalid_contact_identifier"
+		}
+		metrics.BridgeErrors.WithLabelValues(errCode, "bridge").Inc()
+		auditErr := c.logAudit(ctx, tenant.ID, DirC2W, fmt.Sprintf("%d", env.ID), "", nil, "error", errCode, "identificador WhatsApp inválido", 0)
+		return errors.Join(fmt.Errorf("bridge: validate %s: %w", sourceField, jidErr), auditErr)
+	}
+	if err := c.waitForManualOutgoing(ctx, tenant.ID, jid, env.Content); err != nil {
+		return ErrInProgress
 	}
 
 	// 5. Reserva idempotente antes do efeito externo. Claims de processamento
@@ -220,9 +253,13 @@ func (c *Core) HandleChatwootWebhook(ctx context.Context, env chatwoot.WebhookEn
 		return ErrRateLimited
 	}
 
+	messageID := deterministicMessageID(tenant.ID, env.ID)
+	if err := c.Store.MarkC2WOrigin(ctx, string(DirC2W), idempKey, claimToken, messageID, c.IdempotencyTTL); err != nil {
+		return fmt.Errorf("bridge: mark c2w origin: %w", err)
+	}
+
 	// 6. Envia via Evolution Go com o token individual da instância.
 	evo := evogo.NewClient(tenant.EvoBaseURL, tenant.EvoAPIKey)
-	messageID := deterministicMessageID(tenant.ID, env.ID)
 
 	var err2 error
 	if len(env.Attachments) == 0 {
@@ -266,7 +303,7 @@ func (c *Core) HandleChatwootWebhook(ctx context.Context, env chatwoot.WebhookEn
 
 	// 7. Sucesso — conclui a chave antes da auditoria. Uma falha crítica de
 	// persistência é propagada. Idempotência e auditoria são atômicas no DB.
-	detail := json.RawMessage(fmt.Sprintf(`{"latency_ms":%d}`, latencyMS))
+	detail := json.RawMessage(fmt.Sprintf(`{"evo_message_id":%q,"latency_ms":%d}`, messageID, latencyMS))
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	auditEntry := c.newAuditEntry(tenant.ID, DirC2W, fmt.Sprintf("%d", env.ID), jid, []byte(applog.ContentHash(env.Content)), "ok", "", "", latencyMS)
@@ -282,6 +319,258 @@ func (c *Core) HandleChatwootWebhook(ctx context.Context, env chatwoot.WebhookEn
 		"latency_ms", latency.Milliseconds(),
 	)
 	return nil
+}
+
+// HandleEvogoWebhook encaminha uma mensagem direta recebida da Evolution Go
+// para a inbox API correspondente do Chatwoot. O handler HTTP já autenticou o
+// segredo da URL; este método continua aplicando kill switch, idempotência,
+// rate limit e auditoria antes do efeito externo.
+func (c *Core) HandleEvogoWebhook(ctx context.Context, tenant *store.Tenant, env evogo.WebhookEnvelope) error {
+	start := time.Now()
+	paused, err := c.IsPaused(ctx)
+	if err != nil {
+		slog.Warn("bridge: failed to check pause, using env", "err", err)
+		paused = c.Paused
+	}
+	if paused {
+		metrics.BridgeMessages.WithLabelValues(string(DirW2C), "paused").Inc()
+		return ErrPaused
+	}
+
+	message, content, own, skipReason, process, err := env.DirectTextWithReason()
+	if err != nil {
+		metrics.BridgeErrors.WithLabelValues("invalid_evo_payload", "bridge").Inc()
+		auditErr := c.logAudit(ctx, tenant.ID, DirW2C, "", "", nil, "error", "invalid_evo_payload", "payload Evolution inválido", 0)
+		return errors.Join(fmt.Errorf("bridge: validate Evolution Go webhook: %w", err), auditErr)
+	}
+	if !process {
+		metrics.BridgeMessages.WithLabelValues(string(DirW2C), "skipped_event").Inc()
+		slog.Info("bridge: w2c skipped",
+			"tenant", tenant.Name,
+			"reason", skipReason,
+		)
+		return ErrSkipped
+	}
+	jid, _, err := evogo.ParseDirectJID(message.Key.RemoteJID)
+	if err != nil {
+		metrics.BridgeErrors.WithLabelValues("invalid_jid", "bridge").Inc()
+		return fmt.Errorf("bridge: validate incoming JID: %w", err)
+	}
+	if c.LimitPerMin > 0 && !c.getLimiter(tenant.ID, DirW2C).Allow() {
+		metrics.BridgeMessages.WithLabelValues(string(DirW2C), "rate_limited").Inc()
+		return ErrRateLimited
+	}
+	if own {
+		fromChatwoot, err := c.Store.HasCompletedC2WMessage(ctx, tenant.ID, message.Key.ID)
+		if err != nil {
+			return fmt.Errorf("bridge: check c2w origin: %w", err)
+		}
+		if fromChatwoot {
+			metrics.BridgeMessages.WithLabelValues(string(DirW2C), "skipped_c2w_origin").Inc()
+			slog.Info("bridge: w2c skipped", "tenant", tenant.Name, "reason", "c2w_origin")
+			return ErrSkipped
+		}
+	}
+
+	idempKey := fmt.Sprintf("w2c:%s:%s", tenant.Name, message.Key.ID)
+	claimTTL := 2 * time.Minute
+	// Após o Chatwoot confirmar a criação de uma mensagem manual, uma falha
+	// somente na persistência local é ambígua. A reserva longa impede que a
+	// reentrega crie uma segunda mensagem enquanto o operador investiga.
+	if own && c.IdempotencyTTL > 0 {
+		claimTTL = c.IdempotencyTTL
+	}
+	claimToken := uuid.NewString()
+	idempDirection := string(DirW2C)
+	if own {
+		idempDirection = "w2c-own"
+	}
+	claimState, err := c.Store.ClaimIdempotency(ctx, idempDirection, idempKey, tenant.ID, claimTTL, claimToken)
+	if err != nil {
+		return fmt.Errorf("bridge: claim incoming idempotency: %w", err)
+	}
+	if claimState == store.ClaimCompleted {
+		metrics.IdempotencyHits.Inc()
+		metrics.BridgeMessages.WithLabelValues(string(DirW2C), "skipped_duplicate").Inc()
+		return nil
+	}
+	if claimState == store.ClaimInProgress {
+		return ErrInProgress
+	}
+
+	cw := chatwoot.NewClient(tenant.ChatwootBaseURL, tenant.ChatwootAccountID, tenant.ChatwootToken)
+	contact, conversation, sendErr := cw.EnsureContactConversation(ctx, strings.TrimSpace(message.PushName), jid, tenant.ChatwootInboxID)
+	manualCompleted := false
+	manualPublicationCreated := false
+	if sendErr == nil && own {
+		finishManual := c.beginManualOutgoing(tenant.ID, jid, content)
+		chatwootMessageID, outgoingErr := cw.CreateOutgoingMessage(ctx, int64(conversation.ID), content, "text")
+		if outgoingErr == nil {
+			manualPublicationCreated = true
+			outgoingErr = c.completeManualOutgoing(ctx, tenant, idempDirection, idempKey, claimToken, int64(conversation.ID), chatwootMessageID, message.Key.ID, jid, content, int(time.Since(start).Milliseconds()))
+			manualCompleted = outgoingErr == nil
+		}
+		finishManual()
+		sendErr = outgoingErr
+	} else if sendErr == nil {
+		sendErr = cw.CreateIncomingMessage(ctx, int64(conversation.ID), content, "text")
+	}
+	latency := int(time.Since(start).Milliseconds())
+	if sendErr != nil {
+		metrics.BridgeErrors.WithLabelValues("chatwoot_send_failed", "bridge").Inc()
+		metrics.BridgeMessages.WithLabelValues(string(DirW2C), "error").Inc()
+		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		var releaseErr error
+		var transportErr *chatwoot.TransportError
+		if !manualPublicationCreated && !errors.As(sendErr, &transportErr) {
+			releaseErr = c.Store.ReleaseIdempotency(persistCtx, idempDirection, idempKey, claimToken)
+		}
+		auditErr := c.logAudit(persistCtx, tenant.ID, DirW2C, message.Key.ID, jid, []byte(applog.ContentHash(content)), "error", "chatwoot_send_failed", "falha ao publicar no Chatwoot", latency)
+		return errors.Join(fmt.Errorf("bridge: send WhatsApp message to Chatwoot: %w", sendErr), releaseErr, auditErr)
+	}
+	if manualCompleted {
+		mapCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if err := c.Store.CreateContact(mapCtx, &store.ContactMap{TenantID: tenant.ID, JID: jid, ChatwootContactID: contact.ID, SourceID: jid, DisplayName: ""}); err != nil {
+			slog.Warn("bridge: could not persist manual outgoing contact map", "tenant", tenant.Name, "err", err)
+		}
+		metrics.BridgeMessages.WithLabelValues(string(DirW2C), "ok").Inc()
+		metrics.BridgeLatency.WithLabelValues(string(DirW2C)).Observe(time.Since(start).Seconds())
+		slog.Info("bridge: w2c delivered", "tenant", tenant.Name, "message_type", "outgoing", "jid_masked", applog.MaskPhone(jid), "content_hash", applog.ContentHash(content), "latency_ms", latency)
+		return nil
+	}
+	detail := json.RawMessage(fmt.Sprintf(`{"conversation_id":%d,"latency_ms":%d}`, conversation.ID, latency))
+	audit := c.newAuditEntry(tenant.ID, DirW2C, message.Key.ID, jid, []byte(applog.ContentHash(content)), "ok", "", "", latency)
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := c.Store.CompleteDelivery(persistCtx, string(DirW2C), idempKey, claimToken, detail, c.IdempotencyTTL, audit); err != nil {
+		return fmt.Errorf("bridge: complete incoming delivery: %w", err)
+	}
+	// O mapeamento é uma otimização administrativa; a entrega já foi
+	// confirmada de forma atômica com a auditoria. Não retornamos erro (e
+	// portanto não pedimos retry) depois de publicar a mensagem no Chatwoot.
+	if err := c.Store.CreateContact(persistCtx, &store.ContactMap{TenantID: tenant.ID, JID: jid, ChatwootContactID: contact.ID, SourceID: jid, DisplayName: ""}); err != nil {
+		slog.Warn("bridge: could not persist incoming contact map", "tenant", tenant.Name, "err", err)
+	}
+	metrics.BridgeMessages.WithLabelValues(string(DirW2C), "ok").Inc()
+	metrics.BridgeLatency.WithLabelValues(string(DirW2C)).Observe(time.Since(start).Seconds())
+	slog.Info("bridge: w2c delivered", "tenant", tenant.Name, "message_type", messageDirection(own), "jid_masked", applog.MaskPhone(jid), "content_hash", applog.ContentHash(content), "latency_ms", latency)
+	return nil
+}
+
+// beginManualOutgoing marca uma publicação outgoing criada pelo próprio
+// conector. Enquanto ela está em andamento, o webhook Chatwoot correspondente
+// espera a gravação da supressão persistente em vez de reenviar o texto ao
+// WhatsApp por uma corrida normal entre a API e o webhook.
+func (c *Core) beginManualOutgoing(tenantID uuid.UUID, jid, content string) func() {
+	key := manualOutgoingKey(tenantID, jid, content)
+	c.manualOutgoingMu.Lock()
+	if c.manualOutgoing == nil {
+		c.manualOutgoing = make(map[string]*pendingManualOutgoing)
+	}
+	pending := c.manualOutgoing[key]
+	if pending == nil {
+		pending = &pendingManualOutgoing{done: make(chan struct{})}
+		c.manualOutgoing[key] = pending
+	}
+	pending.count++
+	c.manualOutgoingMu.Unlock()
+
+	return func() {
+		c.manualOutgoingMu.Lock()
+		defer c.manualOutgoingMu.Unlock()
+		pending.count--
+		if pending.count == 0 {
+			delete(c.manualOutgoing, key)
+			close(pending.done)
+		}
+	}
+}
+
+// waitForManualOutgoing fecha a pequena janela entre criar a mensagem
+// outgoing na API do Chatwoot e persistir a supressão por seu ID retornado.
+func (c *Core) waitForManualOutgoing(ctx context.Context, tenantID uuid.UUID, jid, content string) error {
+	key := manualOutgoingKey(tenantID, jid, content)
+	c.manualOutgoingMu.Lock()
+	pending := c.manualOutgoing[key]
+	c.manualOutgoingMu.Unlock()
+	if pending == nil {
+		return nil
+	}
+	select {
+	case <-pending.done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("bridge: wait manual WhatsApp publication: %w", ctx.Err())
+	}
+}
+
+func manualOutgoingKey(tenantID uuid.UUID, jid, content string) string {
+	return tenantID.String() + ":" + strings.ToLower(strings.TrimSpace(jid)) + ":" + applog.ContentHash(content)
+}
+
+// completeManualOutgoing conclui, em uma transação, a publicação W2C e a
+// supressão C2W da mensagem criada no Chatwoot. Assim uma falha de banco nunca
+// confirma a mensagem manual sem também proteger o retorno pelo webhook.
+func (c *Core) completeManualOutgoing(ctx context.Context, tenant *store.Tenant, w2cDirection, w2cKey, w2cClaimToken string, conversationID, chatwootMessageID int64, evolutionMessageID, jid, content string, latencyMS int) error {
+	if chatwootMessageID <= 0 {
+		return errors.New("bridge: complete manual outgoing: invalid Chatwoot message id")
+	}
+	c2wKey := fmt.Sprintf("c2w:%s:%d", tenant.Name, chatwootMessageID)
+	c2wClaimToken := uuid.NewString()
+	claimState, err := c.Store.ClaimIdempotency(ctx, string(DirC2W), c2wKey, tenant.ID, c.IdempotencyTTL, c2wClaimToken)
+	if err != nil {
+		return fmt.Errorf("bridge: claim manual c2w suppression: %w", err)
+	}
+	switch claimState {
+	case store.ClaimCompleted:
+		return errors.New("bridge: manual c2w suppression was already completed")
+	case store.ClaimInProgress:
+		return ErrInProgress
+	case store.ClaimAcquired:
+		// Continua para concluir a supressão e registrar a auditoria.
+	default:
+		return fmt.Errorf("bridge: unexpected manual c2w suppression state %q", claimState)
+	}
+	c2wDetail, err := json.Marshal(struct {
+		SuppressedEvolutionMessageID string `json:"suppressed_evo_message_id"`
+		LatencyMS                    int    `json:"latency_ms"`
+	}{SuppressedEvolutionMessageID: evolutionMessageID, LatencyMS: latencyMS})
+	if err != nil {
+		return fmt.Errorf("bridge: encode manual c2w suppression: %w", err)
+	}
+	w2cDetail := json.RawMessage(fmt.Sprintf(`{"conversation_id":%d,"latency_ms":%d}`, conversationID, latencyMS))
+	w2cAudit := c.newAuditEntry(tenant.ID, DirW2C, evolutionMessageID, jid, []byte(applog.ContentHash(content)), "ok", "", "", latencyMS)
+	c2wAudit := c.newAuditEntry(tenant.ID, DirC2W, fmt.Sprintf("%d", chatwootMessageID), jid, []byte(applog.ContentHash(content)), "skipped", "manual_whatsapp_sync", "", latencyMS)
+	if err := c.Store.CompleteManualOutgoing(ctx, w2cDirection, w2cKey, w2cClaimToken, w2cDetail, string(DirC2W), c2wKey, c2wClaimToken, c2wDetail, c.IdempotencyTTL, w2cAudit, c2wAudit); err != nil {
+		return fmt.Errorf("bridge: complete manual outgoing: %w", err)
+	}
+	return nil
+}
+
+func messageDirection(own bool) string {
+	if own {
+		return "outgoing"
+	}
+	return "incoming"
+}
+
+func skippedEventStatus(event string) string {
+	switch event {
+	case "message_updated":
+		return "skipped_message_updated"
+	case "conversation_created":
+		return "skipped_conversation_created"
+	case "conversation_updated":
+		return "skipped_conversation_updated"
+	case "conversation_status_changed":
+		return "skipped_conversation_status_changed"
+	case "conversation_typing_on", "conversation_typing_off", "conversation_recording":
+		return "skipped_conversation_activity"
+	default:
+		return "skipped_event"
+	}
 }
 
 func attachmentFilename(att chatwoot.Attachment) string {

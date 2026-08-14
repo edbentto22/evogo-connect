@@ -1,13 +1,15 @@
 services:
   connector:
     build:
-      context: ..
+      # O Coolify executa Compose com --project-directory na raiz clonada.
+      # Portanto, os caminhos precisam ser relativos à raiz do repositório.
+      context: .
       dockerfile: deploy/Dockerfile
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgres://connect:${SERVICE_PASSWORD_64_POSTGRES}@postgres:5432/evogo_connect?sslmode=disable
-      CONNECT_MASTER_KEY: ${SERVICE_REALBASE64_32_CONNECTOR}
-      ADMIN_TOKEN: ${SERVICE_HEX_64_CONNECTOR_ADMIN}
+      DATABASE_URL: postgres://connect:${SERVICE_PASSWORD_64_POSTGRES:?Coolify_must_generate_POSTGRES_password}@postgres:5432/evogo_connect?sslmode=disable
+      CONNECT_MASTER_KEY: ${SERVICE_REALBASE64_32_CONNECTOR:?Coolify_must_generate_CONNECTOR_master_key}
+      ADMIN_TOKEN: ${SERVICE_HEX_64_ADMIN:?Coolify_must_generate_ADMIN_token}
       # Credenciais opcionais e temporárias usadas apenas pelo `connect setup`.
       # O Coolify as exibe na UI porque estão declaradas no compose; remova os
       # valores e faça redeploy depois que a CLI cifrá-las no Postgres.
@@ -53,7 +55,7 @@ services:
     environment:
       POSTGRES_DB: evogo_connect
       POSTGRES_USER: connect
-      POSTGRES_PASSWORD: ${SERVICE_PASSWORD_64_POSTGRES}
+      POSTGRES_PASSWORD: ${SERVICE_PASSWORD_64_POSTGRES:?Coolify_must_generate_POSTGRES_password}
       POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
     volumes:
       - postgres_data:/var/lib/postgresql/data

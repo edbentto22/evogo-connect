@@ -165,7 +165,34 @@ func (c *Client) CreateConversation(ctx context.Context, sourceID string, contac
 	if err := c.do(ctx, http.MethodPost, path, payload, &out); err != nil {
 		return nil, fmt.Errorf("chatwoot: create conversation: %w", err)
 	}
+	if out.ID == 0 || out.AccountID != c.accountID || out.InboxID != inboxID || out.Status != "open" {
+		return nil, errors.New("chatwoot: conversation returned unexpected binding")
+	}
 	return &out, nil
+}
+
+// FindOpenConversation procura uma conversa aberta do contato na inbox. A API
+// retorna resultados paginados; a primeira página contém as conversas recentes,
+// incluindo a conversa aberta criada pelo connector.
+func (c *Client) FindOpenConversation(ctx context.Context, contactID, inboxID int) (*ConversationResponse, error) {
+	for page := 1; page <= 10; page++ {
+		query := url.Values{"contact_id": []string{fmt.Sprintf("%d", contactID)}, "inbox_id": []string{fmt.Sprintf("%d", inboxID)}, "page": []string{fmt.Sprintf("%d", page)}}.Encode()
+		var out ConversationListResponse
+		path := fmt.Sprintf("/api/v1/accounts/%d/conversations?%s", c.accountID, query)
+		if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+			return nil, fmt.Errorf("chatwoot: list contact conversations: %w", err)
+		}
+		for i := range out.Data {
+			conversation := &out.Data[i]
+			if conversation.InboxID == inboxID && conversation.Status == "open" {
+				return conversation, nil
+			}
+		}
+		if len(out.Data) == 0 {
+			break
+		}
+	}
+	return nil, ErrNotFound
 }
 
 // CreateIncomingMessage posta uma mensagem incoming na conversa.
@@ -176,6 +203,51 @@ func (c *Client) CreateIncomingMessage(ctx context.Context, conversationID int64
 		return fmt.Errorf("chatwoot: create incoming message: %w", err)
 	}
 	return nil
+}
+
+// CreateOutgoingMessage posta uma mensagem pública outgoing e devolve seu ID
+// estável no Chatwoot. O bridge usa esse ID para suprimir o webhook de retorno
+// que, de outro modo, reenviaria uma mensagem manual ao WhatsApp.
+func (c *Client) CreateOutgoingMessage(ctx context.Context, conversationID int64, content, contentType string) (int64, error) {
+	payload := MessageCreatePayload{Content: content, MessageType: "outgoing", Private: false, ContentType: contentType}
+	var out MessageResponse
+	path := fmt.Sprintf("/api/v1/accounts/%d/conversations/%d/messages", c.accountID, conversationID)
+	if err := c.do(ctx, http.MethodPost, path, payload, &out); err != nil {
+		return 0, fmt.Errorf("chatwoot: create outgoing message: %w", err)
+	}
+	if out.ID <= 0 {
+		return 0, errors.New("chatwoot: create outgoing message returned no id")
+	}
+	return out.ID, nil
+}
+
+// EnsureContactConversation cria ou reutiliza o contato, o vínculo da inbox e
+// a conversa de API. O identifier é sempre o JID normalizado pelo bridge.
+func (c *Client) EnsureContactConversation(ctx context.Context, name, jid string, inboxID int) (*ContactResponse, *ConversationResponse, error) {
+	contact, err := c.FindContactByIdentifier(ctx, jid)
+	if err != nil {
+		if !errors.Is(err, ErrNotFound) {
+			return nil, nil, fmt.Errorf("chatwoot: find incoming contact: %w", err)
+		}
+		contact, err = c.CreateContact(ctx, name, jid)
+		if err != nil {
+			return nil, nil, fmt.Errorf("chatwoot: create incoming contact: %w", err)
+		}
+	}
+	if _, err := c.EnsureContactInbox(ctx, contact, inboxID, jid); err != nil {
+		return nil, nil, fmt.Errorf("chatwoot: ensure incoming contact inbox: %w", err)
+	}
+	conversation, err := c.FindOpenConversation(ctx, contact.ID, inboxID)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return nil, nil, fmt.Errorf("chatwoot: find incoming conversation: %w", err)
+	}
+	if errors.Is(err, ErrNotFound) {
+		conversation, err = c.CreateConversation(ctx, jid, contact.ID, inboxID)
+		if err != nil {
+			return nil, nil, fmt.Errorf("chatwoot: create incoming conversation: %w", err)
+		}
+	}
+	return contact, conversation, nil
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {

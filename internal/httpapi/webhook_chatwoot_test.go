@@ -22,6 +22,7 @@ import (
 
 type webhookTestStore struct {
 	tenant *store.Tenant
+	paused bool
 }
 
 func (s *webhookTestStore) Ping(context.Context) error { return nil }
@@ -32,9 +33,15 @@ func (s *webhookTestStore) GetTenantByChatwootInbox(_ context.Context, inboxID i
 	}
 	return s.tenant, nil
 }
+func (s *webhookTestStore) GetTenantByEvoInstance(_ context.Context, instance string) (*store.Tenant, error) {
+	if instance != s.tenant.EvoInstanceName {
+		return nil, store.ErrNotFound
+	}
+	return s.tenant, nil
+}
 
 func (s *webhookTestStore) SetPaused(context.Context, bool, string) error { return nil }
-func (s *webhookTestStore) IsPaused(context.Context) (bool, error)        { return false, nil }
+func (s *webhookTestStore) IsPaused(context.Context) (bool, error)        { return s.paused, nil }
 func (s *webhookTestStore) ListTenants(context.Context) ([]store.Tenant, error) {
 	return []store.Tenant{*s.tenant}, nil
 }
@@ -44,10 +51,20 @@ func (s *webhookTestStore) ClaimIdempotency(context.Context, string, string, uui
 func (s *webhookTestStore) CompleteDelivery(context.Context, string, string, string, []byte, time.Duration, store.BridgeLogEntry) error {
 	return nil
 }
+func (s *webhookTestStore) CompleteManualOutgoing(context.Context, string, string, string, []byte, string, string, string, []byte, time.Duration, store.BridgeLogEntry, store.BridgeLogEntry) error {
+	return nil
+}
+func (s *webhookTestStore) MarkC2WOrigin(context.Context, string, string, string, string, time.Duration) error {
+	return nil
+}
+func (s *webhookTestStore) HasCompletedC2WMessage(context.Context, uuid.UUID, string) (bool, error) {
+	return false, nil
+}
 func (s *webhookTestStore) ReleaseIdempotency(context.Context, string, string, string) error {
 	return nil
 }
-func (s *webhookTestStore) LogBridge(context.Context, store.BridgeLogEntry) error { return nil }
+func (s *webhookTestStore) LogBridge(context.Context, store.BridgeLogEntry) error  { return nil }
+func (s *webhookTestStore) CreateContact(context.Context, *store.ContactMap) error { return nil }
 
 func webhookSignature(secret, timestamp string, body []byte) string {
 	mac := hmac.New(sha256.New, []byte(secret))
@@ -58,10 +75,12 @@ func webhookSignature(secret, timestamp string, body []byte) string {
 
 func newWebhookTestRouter(secret string) http.Handler {
 	st := &webhookTestStore{tenant: &store.Tenant{
-		ID:              uuid.New(),
-		Name:            "demo",
-		ChatwootInboxID: 7,
-		ChatwootHMAC:    secret,
+		ID:               uuid.New(),
+		Name:             "demo",
+		ChatwootInboxID:  7,
+		ChatwootHMAC:     secret,
+		EvoInstanceName:  "demo-evo",
+		EvoWebhookSecret: "url-secret",
 	}}
 	return NewRouter(Deps{
 		Store:        st,
@@ -69,6 +88,44 @@ func newWebhookTestRouter(secret string) http.Handler {
 		AdminToken:   "admin-token",
 		ReplayWindow: 5 * time.Minute,
 	})
+}
+
+func TestEvogoWebhookRejectsInvalidURLSecret(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/webhook/evo/demo-evo/wrong", bytes.NewReader([]byte(`{}`)))
+	recorder := httptest.NewRecorder()
+	newWebhookTestRouter("webhook-secret").ServeHTTP(recorder, req)
+	assert.Equal(t, http.StatusUnauthorized, recorder.Code)
+	assert.JSONEq(t, `{"error":"unauthorized"}`, recorder.Body.String())
+}
+
+func TestEvogoWebhookValidSkipAndBridgeErrorResponses(t *testing.T) {
+	validURL := "/webhook/evo/demo-evo/url-secret"
+	for _, tt := range []struct {
+		name string
+		body string
+		want int
+	}{
+		{name: "unsupported event is skipped", body: `{"event":"CONNECTION_UPDATE","instance":"demo-evo","data":{}}`, want: http.StatusOK},
+		{name: "valid message returns retry on Chatwoot transport error", body: `{"event":"MESSAGE","instance":"demo-evo","data":{"key":{"remoteJid":"5511999999999@s.whatsapp.net","id":"m1"},"message":{"conversation":"oi"},"messageType":"conversation"}}`, want: http.StatusServiceUnavailable},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, validURL, bytes.NewBufferString(tt.body))
+			recorder := httptest.NewRecorder()
+			newWebhookTestRouter("webhook-secret").ServeHTTP(recorder, req)
+			assert.Equal(t, tt.want, recorder.Code)
+		})
+	}
+}
+
+func TestEvogoWebhookPausedAndRateLimitedResponses(t *testing.T) {
+	st := &webhookTestStore{tenant: &store.Tenant{ID: uuid.New(), Name: "demo", ChatwootInboxID: 7, EvoInstanceName: "demo-evo", EvoWebhookSecret: "url-secret"}}
+	st.paused = true
+	router := NewRouter(Deps{Store: st, Bridge: bridge.New(st, time.Hour, false, 1), AdminToken: "admin", ReplayWindow: time.Minute})
+	body := `{"event":"MESSAGE","instance":"demo-evo","data":{"key":{"remoteJid":"5511999999999@s.whatsapp.net","id":"m1"},"message":{"conversation":"oi"},"messageType":"conversation"}}`
+	req := httptest.NewRequest(http.MethodPost, "/webhook/evo/demo-evo/url-secret", bytes.NewBufferString(body))
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	assert.Equal(t, http.StatusServiceUnavailable, recorder.Code)
 }
 
 func TestChatwootWebhookRejectsInvalidAndExpiredSignatures(t *testing.T) {

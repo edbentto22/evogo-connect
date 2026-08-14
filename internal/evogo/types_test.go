@@ -53,3 +53,204 @@ func TestWebhookEnvelopeDecode(t *testing.T) {
 	assert.Equal(t, "MESSAGES_UPSERT", env.Event)
 	assert.Equal(t, "demo", env.Instance)
 }
+
+func TestWebhookEnvelopeIncomingTextContract(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGES_UPSERT","instance":"demo","data":{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":false,"id":"ABC"},"message":{"conversation":"olá"},"messageType":"conversation"}}`), &env))
+	message, content, accepted, err := env.IncomingText()
+	require.NoError(t, err)
+	assert.True(t, accepted)
+	assert.Equal(t, "ABC", message.Key.ID)
+	assert.Equal(t, "olá", content)
+}
+
+func TestWebhookEnvelopeIncomingTextAcceptsEvolutionDotEvent(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"messages.upsert","instance":"demo","data":{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":false,"id":"ABC-dot"},"message":{"conversation":"olá"},"messageType":"conversation"}}`), &env))
+	message, content, accepted, err := env.IncomingText()
+	require.NoError(t, err)
+	assert.True(t, accepted)
+	assert.Equal(t, "ABC-dot", message.Key.ID)
+	assert.Equal(t, "olá", content)
+}
+
+func TestWebhookEnvelopeIncomingTextRejectsUnsupportedEventPunctuation(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"messages---upsert","data":{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":false,"id":"ABC"},"message":{"conversation":"olá"},"messageType":"conversation"}}`), &env))
+	_, _, accepted, err := env.IncomingText()
+	require.NoError(t, err)
+	assert.False(t, accepted)
+}
+
+func TestWebhookEnvelopeIncomingTextAcceptsTextDespiteMessageTypeDrift(t *testing.T) {
+	const text = "texto-de-cliente"
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":false,"id":"ABC"},"message":{"conversation":"`+text+`"},"messageType":"unexpected-build-label"}}`), &env))
+	_, content, reason, accepted, err := env.IncomingTextWithReason()
+	require.NoError(t, err)
+	assert.True(t, accepted)
+	assert.Equal(t, text, content)
+	assert.Empty(t, reason)
+}
+
+func TestWebhookEnvelopeIncomingTextAcceptsTextWithoutMessageType(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"messages.upsert","data":{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":false,"id":"ABC"},"message":{"conversation":"olá"}}}`), &env))
+	_, content, accepted, err := env.IncomingText()
+	require.NoError(t, err)
+	assert.True(t, accepted)
+	assert.Equal(t, "olá", content)
+}
+
+func TestWebhookEnvelopeIncomingTextAcceptsEvolutionGoInfoShape(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","instance":"demo","data":{"info":{"id":"INFO-ABC","chat":{"user":"5511999999999","server":"s.whatsapp.net"},"sender":{"user":"5511999999999","server":"s.whatsapp.net"},"isFromMe":false,"pushName":"João"},"message":{"conversation":"olá"}}}`), &env))
+	message, content, accepted, err := env.IncomingText()
+	require.NoError(t, err)
+	assert.True(t, accepted)
+	assert.Equal(t, "INFO-ABC", message.Key.ID)
+	assert.Equal(t, "5511999999999@s.whatsapp.net", message.Key.RemoteJID)
+	assert.Equal(t, "João", message.PushName)
+	assert.Equal(t, "olá", content)
+}
+
+func TestWebhookEnvelopeIncomingTextSkipsOwnEvolutionGoInfoMessage(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"info":{"id":"INFO-OWN","chat":{"user":"5511999999999","server":"s.whatsapp.net"},"isFromMe":true},"message":{"conversation":"não encaminhar"}}}`), &env))
+	_, _, reason, accepted, err := env.IncomingTextWithReason()
+	require.NoError(t, err)
+	assert.False(t, accepted)
+	assert.Equal(t, "own_message", reason)
+}
+
+func TestWebhookEnvelopeDirectTextAcceptsOwnDirectMessage(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":true,"id":"OWN-1"},"message":{"conversation":"mensagem manual"}}}`), &env))
+	message, content, own, reason, accepted, err := env.DirectTextWithReason()
+	require.NoError(t, err)
+	assert.True(t, accepted)
+	assert.True(t, own)
+	assert.Empty(t, reason)
+	assert.Equal(t, "OWN-1", message.Key.ID)
+	assert.Equal(t, "mensagem manual", content)
+}
+
+func TestWebhookEnvelopeIncomingTextNeverForwardsOwnHybridMessage(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":false,"id":"HYBRID"},"info":{"isFromMe":true},"message":{"conversation":"não encaminhar"}}}`), &env))
+	_, _, reason, accepted, err := env.IncomingTextWithReason()
+	require.NoError(t, err)
+	assert.False(t, accepted)
+	assert.Equal(t, "own_message", reason)
+}
+
+func TestWebhookEnvelopeIncomingTextUsesDirectSenderWhenInfoChatIsLID(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"info":{"id":"INFO-LID","chat":{"user":"123456789","server":"lid"},"sender":{"user":"5511999999999","server":"s.whatsapp.net"},"isFromMe":false},"message":{"conversation":"olá"}}}`), &env))
+	message, _, accepted, err := env.IncomingText()
+	require.NoError(t, err)
+	assert.True(t, accepted)
+	assert.Equal(t, "5511999999999@s.whatsapp.net", message.Key.RemoteJID)
+}
+
+func TestWebhookEnvelopeDirectTextUsesRecipientAltForOwnLIDMessage(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"info":{"id":"OWN-ALT","chat":{"user":"123456789","server":"lid"},"sender":{"user":"5511888888888","server":"s.whatsapp.net"},"recipientAlt":{"user":"5511999999999","server":"s.whatsapp.net"},"isFromMe":true},"message":{"conversation":"texto manual"}}}`), &env))
+	message, _, own, reason, accepted, err := env.DirectTextWithReason()
+	require.NoError(t, err)
+	assert.True(t, accepted)
+	assert.True(t, own)
+	assert.Empty(t, reason)
+	assert.Equal(t, "5511999999999@s.whatsapp.net", message.Key.RemoteJID)
+}
+
+func TestWebhookEnvelopeIncomingTextUsesSenderAltForLIDMessage(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"info":{"id":"IN-ALT","chat":{"user":"123456789","server":"lid"},"sender":{"user":"987654321","server":"lid"},"senderAlt":{"user":"5511999999999","server":"s.whatsapp.net"},"isFromMe":false},"message":{"conversation":"texto recebido"}}}`), &env))
+	message, content, accepted, err := env.IncomingText()
+	require.NoError(t, err)
+	assert.True(t, accepted)
+	assert.Equal(t, "texto recebido", content)
+	assert.Equal(t, "5511999999999@s.whatsapp.net", message.Key.RemoteJID)
+}
+
+func TestWebhookEnvelopeDirectTextKeepsGroupWhenAlternateDirectJIDExists(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"info":{"id":"GROUP-ALT","chat":{"user":"123","server":"g.us"},"recipientAlt":{"user":"5511999999999","server":"s.whatsapp.net"},"isFromMe":true},"message":{"conversation":"não encaminhar"}}}`), &env))
+	_, _, _, reason, accepted, err := env.DirectTextWithReason()
+	require.NoError(t, err)
+	assert.False(t, accepted)
+	assert.Equal(t, "non_direct_message", reason)
+}
+
+func TestWebhookEnvelopeDirectTextKeepsCanonicalKeyBeforeAlternates(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"key":{"remoteJid":"5511777777777@s.whatsapp.net","fromMe":true,"id":"KEY-FIRST"},"info":{"chat":{"user":"123456789","server":"lid"},"recipientAlt":{"user":"5511999999999","server":"s.whatsapp.net"}},"message":{"conversation":"texto"}}}`), &env))
+	message, _, own, _, accepted, err := env.DirectTextWithReason()
+	require.NoError(t, err)
+	assert.True(t, accepted)
+	assert.True(t, own)
+	assert.Equal(t, "5511777777777@s.whatsapp.net", message.Key.RemoteJID)
+}
+
+func TestWebhookEnvelopeDirectTextResolvesLIDKeyWithRecipientAlt(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"key":{"remoteJid":"123456789@lid","fromMe":true,"id":"KEY-LID"},"info":{"chat":{"user":"123456789","server":"lid"},"recipientAlt":{"user":"5511999999999","server":"s.whatsapp.net"}},"message":{"conversation":"texto"}}}`), &env))
+	message, _, own, _, accepted, err := env.DirectTextWithReason()
+	require.NoError(t, err)
+	assert.True(t, accepted)
+	assert.True(t, own)
+	assert.Equal(t, "5511999999999@s.whatsapp.net", message.Key.RemoteJID)
+}
+
+func TestWebhookEnvelopeDirectTextRejectsLIDWithoutDirectAlternative(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"info":{"id":"LID-ONLY","chat":{"user":"123456789","server":"lid"},"sender":{"user":"987654321","server":"lid"},"isFromMe":false},"message":{"conversation":"texto"}}}`), &env))
+	_, _, _, _, _, err := env.DirectTextWithReason()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "message key is required")
+}
+
+func TestWebhookEnvelopeIncomingTextFallsBackFromEmptyConversation(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":false,"id":"ABC"},"message":{"conversation":" ","extendedTextMessage":{"text":"olá"}}}}`), &env))
+	_, content, accepted, err := env.IncomingText()
+	require.NoError(t, err)
+	assert.True(t, accepted)
+	assert.Equal(t, "olá", content)
+}
+
+func TestWebhookEnvelopeIncomingTextReasonNeverContainsContent(t *testing.T) {
+	const privateContent = "conteudo-que-nao-pode-ir-ao-log"
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"key":{"remoteJid":"5511999999999@s.whatsapp.net","fromMe":false,"id":"ABC"},"message":{"imageMessage":{"caption":"`+privateContent+`"}}}}`), &env))
+	_, content, reason, accepted, err := env.IncomingTextWithReason()
+	require.NoError(t, err)
+	assert.False(t, accepted)
+	assert.Empty(t, content)
+	assert.Equal(t, "unsupported_message_structure", reason)
+	assert.NotContains(t, reason, privateContent)
+}
+
+func TestWebhookEnvelopeIncomingTextReportsSafeShapeForMissingKey(t *testing.T) {
+	const privateContent = "nao-deve-aparecer"
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"message":{"conversation":"`+privateContent+`"}}}`), &env))
+	_, _, _, err := env.IncomingText()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "has_key=false has_message=true")
+	assert.NotContains(t, err.Error(), privateContent)
+}
+
+func TestWebhookEnvelopeIncomingTextSupportsExtendedTextAndSkipsBroadcasts(t *testing.T) {
+	var env WebhookEnvelope
+	require.NoError(t, json.Unmarshal([]byte(`{"event":"MESSAGE","data":{"key":{"remoteJid":"5511@s.whatsapp.net","fromMe":false,"id":"x"},"message":{"extendedTextMessage":{"text":"oi"}},"messageType":"extendedTextMessage"}}`), &env))
+	_, content, accepted, err := env.IncomingText()
+	require.NoError(t, err)
+	assert.True(t, accepted)
+	assert.Equal(t, "oi", content)
+	env.Data = json.RawMessage(`{"key":{"remoteJid":"status@broadcast","id":"x"},"message":{"conversation":"oi"},"messageType":"conversation"}`)
+	_, _, accepted, err = env.IncomingText()
+	require.NoError(t, err)
+	assert.False(t, accepted)
+}

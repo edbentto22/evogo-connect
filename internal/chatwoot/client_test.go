@@ -122,6 +122,38 @@ func TestEnsureContactInboxRecoversConcurrentConflict(t *testing.T) {
 	assert.Equal(t, 11, ci.ID)
 }
 
+func TestCreateConversationUsesMappedContactAndInbox(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "/api/v1/accounts/1/conversations", r.URL.Path)
+		assert.Equal(t, "token", r.Header.Get("api_access_token"))
+		var payload ConversationCreatePayload
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+		assert.Equal(t, "5511999999999@s.whatsapp.net", payload.SourceID)
+		assert.Equal(t, 42, payload.ContactID)
+		assert.Equal(t, 7, payload.InboxID)
+		assert.Equal(t, "open", payload.Status)
+		// Este é o formato plano retornado pela action create do Chatwoot/Fazer.ai.
+		_, _ = w.Write([]byte(`{"id":99,"account_id":1,"inbox_id":7,"status":"open"}`))
+	}))
+	defer server.Close()
+
+	conversation, err := NewClient(server.URL, 1, "token").CreateConversation(context.Background(), "5511999999999@s.whatsapp.net", 42, 7)
+	require.NoError(t, err)
+	assert.Equal(t, 99, conversation.ID)
+}
+
+func TestCreateConversationRejectsUnexpectedBinding(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":99,"account_id":1,"inbox_id":8,"status":"open"}`))
+	}))
+	defer server.Close()
+
+	_, err := NewClient(server.URL, 1, "token").CreateConversation(context.Background(), "5511999999999@s.whatsapp.net", 42, 7)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "unexpected binding")
+}
+
 func TestClientHTTPErrorDoesNotExposeResponseBody(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusUnprocessableEntity)
@@ -165,4 +197,43 @@ func TestClientDoesNotForwardTokenAcrossRedirect(t *testing.T) {
 	_, err := NewClient(redirector.URL, 1, "chatwoot-token").GetInbox(context.Background(), 7)
 	require.Error(t, err)
 	assert.Empty(t, leaked)
+}
+
+func TestFindOpenConversationAcceptsFazerAIPayloadAndPaginates(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "/api/v1/accounts/1/conversations", r.URL.Path)
+		assert.Equal(t, "44", r.URL.Query().Get("contact_id"))
+		assert.Equal(t, "7", r.URL.Query().Get("inbox_id"))
+		switch r.URL.Query().Get("page") {
+		case "1":
+			_, _ = w.Write([]byte(`{"data":{"payload":[{"id":2,"inbox_id":7,"status":"resolved"}]}}`))
+		case "2":
+			_, _ = w.Write([]byte(`{"data":[{"id":3,"inbox_id":7,"status":"open"}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	conversation, err := NewClient(server.URL, 1, "token").FindOpenConversation(context.Background(), 44, 7)
+	require.NoError(t, err)
+	assert.Equal(t, 3, conversation.ID)
+}
+
+func TestCreateOutgoingMessageUsesPublicOutgoingContract(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "/api/v1/accounts/1/conversations/91/messages", r.URL.Path)
+		var payload MessageCreatePayload
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+		assert.Equal(t, "outgoing", payload.MessageType)
+		assert.False(t, payload.Private)
+		assert.Equal(t, "texto manual", payload.Content)
+		_, _ = w.Write([]byte(`{"id":1234}`))
+	}))
+	defer server.Close()
+
+	id, err := NewClient(server.URL, 1, "token").CreateOutgoingMessage(context.Background(), 91, "texto manual", "text")
+	require.NoError(t, err)
+	assert.Equal(t, int64(1234), id)
 }

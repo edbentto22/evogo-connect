@@ -13,16 +13,19 @@ fail() {
 command -v docker >/dev/null 2>&1 || fail "docker não encontrado"
 docker compose version >/dev/null 2>&1 || fail "docker compose não encontrado"
 test -f "$COMPOSE_FILE" || fail "arquivo ausente: deploy/docker-compose.coolify.yml"
+test -r "$ROOT_DIR/deploy/Dockerfile" || fail "Dockerfile ausente ou ilegível"
 umask 077
+
+compose=(docker compose --env-file /dev/null --project-directory "$ROOT_DIR" -f "$COMPOSE_FILE")
 
 required_magic_variables=(
   'SERVICE_PASSWORD_64_POSTGRES'
   'SERVICE_REALBASE64_32_CONNECTOR'
-  'SERVICE_HEX_64_CONNECTOR_ADMIN'
+  'SERVICE_HEX_64_ADMIN'
 )
 
 for variable in "${required_magic_variables[@]}"; do
-  grep -Fq "\${$variable}" "$COMPOSE_FILE" || fail "magic variable ausente: $variable"
+  grep -Fq "\${$variable:?" "$COMPOSE_FILE" || fail "magic variable não usa operador obrigatório :?: $variable"
 done
 
 # Valores locais descartáveis existem apenas para o parser do Compose. Eles
@@ -30,17 +33,28 @@ done
 # o arquivo renderizado. Em produção, o Coolify gera e preserva os valores.
 export SERVICE_PASSWORD_64_POSTGRES="compose-validation-password"
 export SERVICE_REALBASE64_32_CONNECTOR="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
-export SERVICE_HEX_64_CONNECTOR_ADMIN="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+export SERVICE_HEX_64_ADMIN="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 export CHATWOOT_TOKEN=""
 export EVO_INSTANCE_TOKEN=""
 export BRIDGE_PAUSED="true"
+
+# Cada segredo deve impedir a renderização quando ausente. Isso valida o
+# comportamento que evita containers reiniciando com configuração vazia.
+for variable in "${required_magic_variables[@]}"; do
+  if env -u "$variable" "${compose[@]}" config >/dev/null 2>&1; then
+    fail "compose aceita segredo obrigatório ausente: $variable"
+  fi
+done
 
 rendered_file="$(mktemp)"
 postgres_file="$(mktemp)"
 connector_file="$(mktemp)"
 trap 'rm -f "$rendered_file" "$postgres_file" "$connector_file"' EXIT
 
-docker compose -f "$COMPOSE_FILE" config >"$rendered_file"
+# Reproduz a resolução de caminhos usada pelo Coolify. Sem
+# --project-directory, o Compose local usaria deploy/ como base e poderia
+# aprovar um contexto que falha na VPS.
+"${compose[@]}" config >"$rendered_file"
 
 extract_service() {
   local service="$1"
@@ -53,7 +67,7 @@ extract_service() {
   ' "$rendered_file" >"$destination"
 }
 
-services="$(docker compose -f "$COMPOSE_FILE" config --services)"
+services="$("${compose[@]}" config --services)"
 test "$services" = $'connector\npostgres' || test "$services" = $'postgres\nconnector' || \
   fail "o stack deve conter somente connector e postgres"
 
@@ -78,6 +92,10 @@ if grep -Eq '^networks:|^    networks:' "$COMPOSE_FILE"; then
 fi
 
 grep -Eq '^    healthcheck:$' "$connector_file" || fail "connector sem healthcheck"
+grep -Eq '^      context: \.$' "$COMPOSE_FILE" || fail "contexto-fonte deve ser relativo à raiz: ."
+grep -Eq '^      dockerfile: deploy/Dockerfile$' "$COMPOSE_FILE" || fail "Dockerfile-fonte deve partir da raiz"
+grep -Fq "context: $ROOT_DIR" "$connector_file" || fail "contexto renderizado não aponta para a raiz"
+grep -Fq 'dockerfile: deploy/Dockerfile' "$connector_file" || fail "Dockerfile renderizado não parte da raiz"
 grep -Fq '/app/evogo-connect' "$connector_file" || fail "healthcheck do connector não usa o binário"
 grep -Fq -- '--healthcheck' "$connector_file" || fail "healthcheck do connector não consulta /readyz"
 grep -Fq 'condition: service_healthy' "$connector_file" || fail "connector não aguarda postgres saudável"
@@ -97,7 +115,7 @@ if grep -Fxq '*.sql' "$ROOT_DIR/.dockerignore"; then
   fail ".dockerignore exclui as migrations SQL do contexto de build"
 fi
 
-volumes="$(docker compose -f "$COMPOSE_FILE" config --volumes)"
+volumes="$("${compose[@]}" config --volumes)"
 grep -Fxq 'postgres_data' <<<"$volumes" || fail "volume nomeado postgres_data ausente"
 
 printf 'OK: compose Coolify renderiza com persistência, isolamento, hardening e healthchecks declarados.\n'

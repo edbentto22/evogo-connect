@@ -1,8 +1,8 @@
 # Guia de uso — evogo-connect
 
-> **O que este conector faz (Etapa 1 — já funcionando):**
-> Quando um agente responde uma conversa no Chatwoot, a mensagem chega
-> no WhatsApp do cliente via evolution-go. Idempotente, auditado, com HMAC.
+> **O que este conector faz:** integra os dois sentidos: respostas de agentes
+> no Chatwoot chegam ao WhatsApp e textos recebidos no WhatsApp aparecem como
+> mensagens incoming na inbox correta. Ambos são idempotentes e auditados.
 
 ---
 
@@ -118,18 +118,32 @@ O que aconteceu:
 1. **Inbox API no Chatwoot** foi criada com `webhook_url = https://evogo.empresa.com/webhook/chatwoot` e HMAC obrigatório.
 2. O campo top-level **`secret`** retornado pelo Chatwoot foi persistido para validar `X-Chatwoot-Signature` e `X-Chatwoot-Timestamp`.
 3. O token individual da instância Evolution Go foi validado em `/instance/status`.
-4. **Tenant persistido** no Postgres (tokens cifrados com `CONNECT_MASTER_KEY`).
+4. **Tenant e segredo do webhook** são persistidos no Postgres (cifrados com
+   `CONNECT_MASTER_KEY`).
+5. A Evolution Go recebe uma URL exclusiva por instância, com o segredo no
+   caminho e assinatura apenas da categoria `MESSAGE` (o evento recebido pode
+   ser chamado de `MESSAGE` ou `MESSAGES_UPSERT`). O conector aceita tanto o
+   formato de chave `data.key` quanto o formato nativo `data.info` documentado
+   pela Evolution Go. Se este último usar um LID interno, o conector usa apenas
+   `senderAlt` ou `recipientAlt` que sejam JIDs diretos válidos. Não copie a
+   URL para logs, tickets ou chats.
 
-O webhook Evolution Go → Chatwoot não é configurado nesta etapa, pois o
-handler seguro desse sentido será entregue na Etapa 2.
+### Sincronização de mensagens manuais
+
+Mensagens de texto diretas enviadas pelo aplicativo WhatsApp do número
+conectado também aparecem na conversa correspondente como mensagens de saída
+do Chatwoot. O conector ignora grupos, listas de transmissão, status,
+newsletters e mídia. Uma mensagem enviada pelo próprio Chatwoot não volta para
+a conversa como cópia, e a mensagem criada pelo conector no Chatwoot não é
+reenviada ao WhatsApp.
 
 ---
 
 ## 4. Adicionar contatos
 
-> Em produção (Etapa 2), o próprio forward bridge vai criar contatos
-> automaticamente quando o cliente mandar a primeira mensagem WhatsApp.
-> Por enquanto (Etapa 1), você precisa adicionar manualmente:
+> O conector cria contatos, vínculo com a inbox e conversa automaticamente
+> quando chega o primeiro texto do WhatsApp. `add-contact` continua útil para
+> iniciar uma conversa outbound antes de uma mensagem do cliente:
 
 ```bash
 ./bin/connect add-contact \
@@ -142,6 +156,19 @@ Isso cria ou reutiliza o contato pelo campo `identifier`, garante um
 `contact_inbox` cujo `source_id` é exatamente o JID e salva o mapeamento no
 `contact_map`. Pronto — o agente já pode responder e a
 mensagem vai chegar no WhatsApp do João.
+
+Se precisar abrir a conversa do contato pela linha de comando, sem usar um
+token do Chatwoot no terminal:
+
+```bash
+./bin/connect start-conversation \
+  --tenant demo \
+  --jid 5511999999999@s.whatsapp.net
+```
+
+Abra a conversa retornada pelo comando e responda nela. Caso uma requisição
+expire, confirme a conversa no Chatwoot antes de repetir o comando, pois o
+Chatwoot pode ter criado a conversa mesmo sem a resposta chegar ao connector.
 
 ### Adicionar mais contatos
 
@@ -363,30 +390,28 @@ tenants em paralelo (multi-empresa).
 
 ---
 
-## 9. Limites da Etapa 1
+## 9. Limites atuais
 
-- **Reverse only** — agente → WhatsApp funciona. Cliente → Chatwoot (forward)
-  entra na Etapa 2.
+- **Texto direto** — ambos os sentidos funcionam, inclusive mensagens diretas
+  enviadas manualmente pelo número conectado. Mensagens de grupo, mídia e
+  status recebidos da Evolution Go são ignorados nesta versão.
 - **Mídia:** só o primeiro anexo da mensagem é enviado (Etapa 5 amplia pra
   múltiplos anexos + transcrição de áudio).
-- **Contactos:** precisa adicionar manualmente via `connect add-contact` até
-  a Etapa 2 (que vai auto-criar).
+- **Contactos:** mensagens recebidas criam o contato e vínculo automaticamente.
+  `connect add-contact` é apenas um atalho para iniciar atendimento outbound.
 - **Grupos WhatsApp:** fora de escopo (Etapa 7).
 - **Status updates** (delivered/read): fora de escopo (Etapa 6).
 
 ---
 
-## 10. Próximos passos (Etapas 2+)
+## 10. Próximos passos
 
-- **Etapa 2** — Forward bridge: cliente manda WhatsApp → recebe no Chatwoot
-  como `incoming`. Auto-cria contato no Chatwoot. Resolve o TODO de
-  `connect add-contact` manual.
-- **Etapa 3** — Hardening: testes de carga, OpenAPI, pprof, exemplos
+- **Hardening** — testes de carga, OpenAPI, pprof, exemplos
   de dashboards Grafana.
 - **Etapa 5** — Mídia rica: múltiplos anexos, voice notes com transcrição
   opcional (Whisper local), stickers.
 - **Etapa 6** — Status updates: MESSAGES_UPDATE do evolution-go refletido
   no Chatwoot (delivered/read).
 
-Quando você terminar de validar a Etapa 1 (rodar o smoke E2E com Chatwoot
-+ evolution-go reais), me avisa que a gente segue pra Etapa 2.
+Depois do deploy, faça um smoke: envie um texto do WhatsApp e confirme a
+mensagem `incoming` na inbox correta do Chatwoot.

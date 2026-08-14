@@ -9,7 +9,7 @@
 |---|---|
 | Chatwoot → evogo-connect | `X-Chatwoot-Signature: sha256=<digest>` validado em tempo constante sobre `X-Chatwoot-Timestamp + "." + body`, com janela de 5 minutos. |
 | evogo-connect → Evolution Go | Header `apikey` recebe o token individual da instância; a chave global não é aceita no fluxo de envio. |
-| evolution-go → evogo-connect (Etapa 2) | Header `X-Evogo-Secret` validado por tenant; replay window 5 min. |
+| evolution-go → evogo-connect | Segredo aleatório por instância no caminho da URL, validado em tempo constante. A Evolution Go 0.7.2 não oferece header secreto configurável; acesso aos logs do proxy deve ser restrito. |
 | Admin (`/admin/*`) | Header `X-Admin-Token` (config). Token NUNCA em log. |
 
 **Constant-time compare** em qualquer verificação de assinatura (`hmac.Equal`).
